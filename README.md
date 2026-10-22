@@ -7,6 +7,22 @@ Real DualSense voice-coil haptics for Gears of War: E-Day on Steam, as a small `
 >
 > **To play offline without anti-cheat, use [Gears of War E-Day EAC Offline Bypass](https://www.nexusmods.com/gearsofwareday/mods/4) on Nexus Mods, or set the Windows environment variable `EOS_USE_ANTICHEATCLIENTNULL` to `1` and restart your PC.**
 
+## Contents
+
+* [Why this mod](#why-this-mod)
+* [Features](#features)
+* [Requirements](#requirements)
+* [Install](#install)
+* [Settings](#settings)
+* [Mapping more sounds](#mapping-more-sounds)
+* [Files](#files)
+* [Building it yourself](#building-it-yourself)
+* [How it works](#how-it-works)
+* [Troubleshooting](#troubleshooting)
+* [Disclaimer](#disclaimer)
+* [Credits](#credits)
+* [License](#license)
+
 ## Why this mod
 
 The PC version already supports most of the DualSense: adaptive triggers, gyro, lightbar and PlayStation button prompts. Sadly the biggest one, HD haptics, is not supported, and the game falls back to the old two-motor rumble. This mod adds it.
@@ -21,7 +37,7 @@ The PC version already supports most of the DualSense: adaptive triggers, gyro, 
 ## Requirements
 
 * Gears of War: E-Day on Steam (Windows), **with Easy Anti-Cheat off**, campaign only.
-* A DualSense or DualSense Edge controller connected by **USB cable**. The haptics use the controller's USB audio device, which does not exist over Bluetooth.
+* A DualSense or DualSense Edge controller. **Use a USB cable, or for Bluetooth use [DSZ](https://github.com/MaximumFreak/dsz) (DualSense mode) or DSX with its Bluetooth haptics. Without one of these the haptics do not work over Bluetooth.**
 * Nothing plugged into the controller's headphone jack. A headset in the jack turns the haptics off.
 * Steam Input off for the game, so the game talks to the DualSense directly.
 
@@ -32,7 +48,7 @@ The PC version already supports most of the DualSense: adaptive triggers, gyro, 
    * `winmm.dll` the mod
    * `GearsHaptics.ini` settings
    * `GearsHaptics_events.ini` the list of sounds you can feel
-3. Plug in the DualSense by USB and start the game with anti-cheat off. You should feel a short chime when the haptics connect.
+3. Connect the DualSense (USB, or Bluetooth through DSZ or DSX) and start the game with anti-cheat off. You should feel a short chime when the haptics connect.
 
 To uninstall, delete `winmm.dll` (and the two `.ini` files if you like).
 
@@ -96,7 +112,8 @@ Both write `out\winmm.dll`, `out\GearsHaptics.ini` and `out\GearsHaptics_events.
 ## Troubleshooting
 
 * Look in `GearsHaptics.log` next to the game's exe. It says when the DualSense audio device is found and when the game opens the controller.
-* No haptics at all: check the USB cable, unplug anything from the headphone jack, and turn off Bluetooth on the PC (or unpair the controller) so it does not stay connected wirelessly.
+* No haptics at all on USB: check the cable, unplug anything from the headphone jack, and turn off Bluetooth on the PC (or unpair the controller) so it does not stay connected wirelessly.
+* No haptics on Bluetooth: make sure DSZ is in DualSense mode (or DSX has Bluetooth haptics on) before starting the game.
 * No sound haptics but rumble works: make sure `HookWwise=1`.
 * The game crashes about 15 seconds after launch: set `HookWwise=0` and report it with your log.
 * Too strong or too weak: change `Strength`, or a single category in `[Sound]`.
