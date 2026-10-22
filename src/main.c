@@ -1,5 +1,5 @@
 /*
- * Lambent: Gears of War: E-Day DualSense haptics. winmm.dll proxy (formerly lantern).
+ * Gears Haptics: Gears of War: E-Day DualSense haptics. winmm.dll proxy (formerly lantern, briefly Lambent).
  * Phase 1: catch the game's DualSense rumble in its HID output reports,
  * strip the motor values (triggers, lights untouched) and play real
  * waveforms on the voice coils through the controller's USB audio endpoint.
@@ -20,7 +20,7 @@
 #include "winmm_names.h"
 #include "events_default.h"
 
-#define LANTERN_VERSION "0.2.0"
+#define LANTERN_VERSION "0.2.1"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -68,7 +68,7 @@ static float ini_f(const wchar_t *sec, const wchar_t *key, float def)
 }
 
 static const char *DEFAULT_INI =
-    "; Lambent settings. Delete this file to get the defaults back.\r\n"
+    "; Gears Haptics settings. Delete this file to get the defaults back.\r\n"
     "[General]\r\n"
     "Enabled=1\r\n"
     "; master haptic strength 0..2\r\n"
@@ -100,11 +100,11 @@ static const char *DEFAULT_INI =
     "HookWwise=1\r\n"
     "; log each Wwise event as it plays (spammy ids stop after 20 lines)\r\n"
     "LogPosts=1\r\n"
-    "; look up event names in game memory at 1, 3 and 6 minutes, writes lambent_catalog.txt\r\n"
+    "; look up event names in game memory at 1, 3 and 6 minutes, writes gears_haptics_catalog.txt\r\n"
     "NameScan=1\r\n"
-    "; the sound event list lives in lambent_events.ini next to this file\r\n";
+    "; the sound event list lives in gears_haptics_events.ini next to this file\r\n";
 
-/* added to an older lambent.ini that has no [Sound] section yet */
+/* added to an older gears_haptics.ini that has no [Sound] section yet */
 static const char *DEFAULT_SOUND_INI =
     "\r\n[Sound]\r\n"
     "; strength per kind of sound haptic (0 = off, 1 = default, up to 2)\r\n"
@@ -170,15 +170,15 @@ static volatile LONG g_evQ[64], g_evW, g_evFired;
 static void load_events(void)
 {
     static wchar_t buf[262144];
-    wchar_t evp[MAX_PATH]; wcscpy(evp, g_dir); wcscat(evp, L"lambent_events.ini");
-    {   /* replace an events file from an older version (keeps it as lambent_events.old.ini) */
+    wchar_t evp[MAX_PATH]; wcscpy(evp, g_dir); wcscat(evp, L"gears_haptics_events.ini");
+    {   /* replace an events file from an older version (keeps it as gears_haptics_events.old.ini) */
         HANDLE h = CreateFileW(evp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
         if (h != INVALID_HANDLE_VALUE) {
             char hd[512] = ""; DWORD r = 0; ReadFile(h, hd, sizeof hd - 1, &r, NULL); hd[r] = 0; CloseHandle(h);
             if (!strstr(hd, "format 3")) {
-                wchar_t old[MAX_PATH]; wcscpy(old, g_dir); wcscat(old, L"lambent_events.old.ini");
+                wchar_t old[MAX_PATH]; wcscpy(old, g_dir); wcscat(old, L"gears_haptics_events.old.ini");
                 MoveFileExW(evp, old, MOVEFILE_REPLACE_EXISTING);
-                L("[ev] old lambent_events.ini kept as lambent_events.old.ini, writing the new defaults");
+                L("[ev] old gears_haptics_events.ini kept as gears_haptics_events.old.ini, writing the new defaults");
             }
         }
     }
@@ -859,10 +859,10 @@ static void name_scan(int pass)
     }
     int named = 0; for (int h = 0; h < AKH; h++) if (g_akId[h] && g_akName[h]) named++;
     L("[name] scan %d: %.0f MB in %lu ms, %d of %ld posted ids named, catalog %d (+%d)", pass, scanned / 1048576.0, GetTickCount() - t0, named, g_akUnique, g_catN, g_catN - before);
-    wchar_t p[MAX_PATH]; wcscpy(p, g_dir); wcscat(p, L"lambent_catalog.txt");
+    wchar_t p[MAX_PATH]; wcscpy(p, g_dir); wcscat(p, L"gears_haptics_catalog.txt");
     FILE *f = _wfopen(p, L"w");
     if (!f) return;
-    fprintf(f, "# Lambent %s event catalog, scan %d. id, times posted this session, name\n", LANTERN_VERSION, pass);
+    fprintf(f, "# Gears Haptics %s event catalog, scan %d. id, times posted this session, name\n", LANTERN_VERSION, pass);
     for (int k = 0; k < CATN; k++) if (g_catId[k]) { int s2 = ak_find(g_catId[k]); fprintf(f, "%u\t%ld\t%s\n", g_catId[k], s2 >= 0 ? g_akCnt[s2] : 0L, g_catName[k]); }
     for (int h = 0; h < AKH; h++) if (g_akId[h] && !g_akName[h]) fprintf(f, "%u\t%ld\t?\n", (DWORD)g_akId[h], g_akCnt[h]);
     fclose(f);
@@ -1422,16 +1422,19 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)
     load_real_winmm();
     GetModuleFileNameW(inst, g_dir, MAX_PATH);
     wchar_t *sl = wcsrchr(g_dir, L'\\'); if (sl) sl[1] = 0;
-    wchar_t logp[MAX_PATH]; wcscpy(logp, g_dir); wcscat(logp, L"lambent.log");
-    wcscpy(g_ini, g_dir); wcscat(g_ini, L"lambent.ini");
+    wchar_t logp[MAX_PATH]; wcscpy(logp, g_dir); wcscat(logp, L"gears_haptics.log");
+    wcscpy(g_ini, g_dir); wcscat(g_ini, L"gears_haptics.ini");
     {   /* carry settings over from the lantern builds */
-        wchar_t old[MAX_PATH]; wcscpy(old, g_dir); wcscat(old, L"lantern.ini");
-        if (GetFileAttributesW(g_ini) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES) MoveFileW(old, g_ini);
+        static const wchar_t *olds[] = { L"lambent.ini", L"lantern.ini" };
+        for (int i = 0; i < 2; i++) {
+            wchar_t old[MAX_PATH]; wcscpy(old, g_dir); wcscat(old, olds[i]);
+            if (GetFileAttributesW(g_ini) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES) MoveFileW(old, g_ini);
+        }
     }
     InitializeCriticalSection(&g_logCs);
     g_log = _wfopen(logp, L"w");
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(NULL, exe, MAX_PATH);
-    L("Lambent %s starting in %ls", LANTERN_VERSION, exe);
+    L("Gears Haptics %s starting in %ls", LANTERN_VERSION, exe);
     L("real winmm: %p", g_realWinmm);
     load_config();
     install_hooks();
