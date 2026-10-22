@@ -18,8 +18,9 @@
 #include <math.h>
 #include "MinHook.h"
 #include "winmm_names.h"
+#include "events_default.h"
 
-#define LANTERN_VERSION "0.1.6"
+#define LANTERN_VERSION "0.1.7"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -99,10 +100,7 @@ static const char *DEFAULT_INI =
     "LogPosts=1\r\n"
     "; look up event names in game memory at 1, 3 and 6 minutes, writes lantern_events.txt\r\n"
     "NameScan=1\r\n"
-    "\r\n[Events]\r\n"
-    "; sound event haptics, allowlist only. id=preset,gain,side\r\n"
-    "; presets: tick click knock thump buzz   side: B both, L left, R right\r\n"
-    "; example: 1234567890=click,0.8,B\r\n";
+    "; sound event haptics live in lantern_events.ini next to this file\r\n";
 
 /* ---------------- sound event haptics (allowlist) ---------------- */
 typedef struct { const char *name; float hz, decayMs, lenMs; } Preset;
@@ -111,15 +109,20 @@ static const Preset g_presets[] = {
     { "thump", 65, 70, 180 }, { "buzz", 185, 90, 140 },
 };
 #define NPRESET (int)(sizeof g_presets / sizeof g_presets[0])
-#define MAXEV 256
+#define MAXEV 2048
 static struct { DWORD id; int preset; float gain; int side; } g_ev[MAXEV];
 static int g_evN;
 static volatile LONG g_evQ[64], g_evW, g_evFired;
 
 static void load_events(void)
 {
-    static wchar_t buf[32768];
-    DWORD n = GetPrivateProfileSectionW(L"Events", buf, 32768, g_ini);
+    static wchar_t buf[262144];
+    wchar_t evp[MAX_PATH]; wcscpy(evp, g_dir); wcscat(evp, L"lantern_events.ini");
+    if (GetFileAttributesW(evp) == INVALID_FILE_ATTRIBUTES) {
+        HANDLE h = CreateFileW(evp, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, DEFAULT_EVENTS_INI, (DWORD)strlen(DEFAULT_EVENTS_INI), &w, NULL); CloseHandle(h); }
+    }
+    DWORD n = GetPrivateProfileSectionW(L"Events", buf, 262144, evp);
     for (wchar_t *e = buf; n && *e && g_evN < MAXEV; e += wcslen(e) + 1) {
         if (*e == L';') continue;
         DWORD id = (DWORD)wcstoul(e, NULL, 10);
@@ -133,7 +136,7 @@ static void load_events(void)
         if (pi < 0) { L("[ev] unknown preset '%ls' for %u", pn, id); continue; }
         float gain = 1.f; int side = 0;
         if (*v == L',') { v++; gain = (float)wcstod(v, &v); }
-        if (*v == L',') { v++; side = (*v == L'L' || *v == L'l') ? 1 : (*v == L'R' || *v == L'r') ? 2 : 0; }
+        if (*v == L',') { v++; side = (*v == L'L' || *v == L'l') ? 1 : (*v == L'R' || *v == L'r') ? 2 : (*v == L'A' || *v == L'a') ? 3 : 0; }
         g_ev[g_evN].id = id; g_ev[g_evN].preset = pi; g_ev[g_evN].gain = gain; g_ev[g_evN].side = side; g_evN++;
     }
     L("[ev] %d allowlisted sound events", g_evN);
@@ -1082,6 +1085,7 @@ static void synth_fill(Synth *S, BYTE *out, UINT frames, int ch, int isFloat, in
         Voice *vo = &S->v[slot];
         vo->ph = 0; vo->hz = pr->hz; vo->amp = g_ev[ei].gain * C.evGain;
         vo->decay = expf(-1.f / (sr * pr->decayMs / 1000.f)); vo->left = (int)(sr * pr->lenMs / 1000.f); vo->side = g_ev[ei].side;
+        if (vo->side == 3) { static int alt; alt ^= 1; vo->side = alt ? 1 : 2; }
     }
     if (sum - S->lastSum > C.trThresh) { S->tr += (sum - S->lastSum) * C.trGain; if (S->tr > 1) S->tr = 1; }
     S->lastSum = sum;
