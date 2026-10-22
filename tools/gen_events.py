@@ -112,12 +112,23 @@ for n in sorted(names):
             elif any(w.startswith(r) for r in RIFLE): pr, g = 'click', 0.45
             else: pr, g = 'knock', 0.7
         out.append((n, cat[n], pr, g, sd, cg)); break
-print('; lantern sound event haptics, format 2. One line per event: id=preset,gain,side,category  ; name')
-print('; presets: tick click knock thump buzz (shapes in lantern.ini [Presets]). side: B both, L, R, A alternate (boots)')
-print('; category strength is set in lantern.ini [Sound]. cine = cutscene marker, mutes sound haptics while cutscenes play')
+print('; Lambent sound event haptics, format 3. One line per event: id=preset,gain,side,category  ; name')
+print('; presets: tick click knock thump buzz (shapes in lambent.ini [Presets]). side: B both, L, R, A alternate (boots)')
+print('; category strength is set in lambent.ini [Sound]. cine = cutscene marker, mutes sound haptics while cutscenes play')
 print('; comment a line with ; to turn that event off. Delete this file to get the defaults back.')
 print('[Events]')
 sec = None
+LOOPS = [
+ # group, start names, preset, gain, side, category, periodMs, maxSec, dubMs, stop names (or 'rumble')
+ ('lancer', ['Play_WEP_ProtoLancer_Fire_FirstShot','Play_WEP_ProtoLancer_Fire','Play_WEP_Lancer_MK1_Fire_FirstShot','Play_WEP_Lancer_MK1_Fire'], 'click', 0.5, 'B', 'Guns', 90, 8, 0, ['rumble','Stop_WEP_ProtoLancer_Fire','Stop_WEP_Lancer_MK1_Fire']),
+ ('chainsaw', ['Play_WEP_INT_Chainsaw_Start','Play_WEP_Ability_Chainsaw_Start','Play_WEP_INT_Chainsaw_Rev_Medium','Play_WEP_INT_Chainsaw_Rev_Large','Play_WEP_Ability_Chainsaw_Rev_Small','Play_WEP_Ability_Chainsaw_Rev_Medium','Play_WEP_Ability_Chainsaw_Rev_Large'], 'buzz', 0.5, 'B', 'Chainsaw', 70, 10, 0, ['Play_WEP_INT_Chainsaw_Stop','Play_WEP_Ability_Chainsaw_Stop']),
+ ('chainsawcut', ['Play_WEP_INT_Chainsaw_Slash_Start','Play_WEP_INT_Chainsaw_Cutting_Metal'], 'thump', 0.9, 'B', 'Chainsaw', 50, 8, 0, ['Play_WEP_INT_Chainsaw_Slash_Stop','Play_WEP_INT_Chainsaw_Stop','Play_WEP_Ability_Chainsaw_Stop']),
+ ('chainsawduel', ['Play_WEP_INT_Chainsaw_Duelling_Start','Play_WEP_Ability_Chainsaw_Duelling_Start'], 'thump', 1.0, 'B', 'Chainsaw', 45, 15, 0, ['Play_WEP_INT_Chainsaw_Duelling_Stop','Play_WEP_Ability_Chainsaw_Duelling_Stop']),
+ ('heartbeat', ['Play_UI_LowHealth_Warning_Loop','Play_UI_LowHealth_Warning'], 'thump', 0.6, 'B', 'HUD', 900, 30, 160, ['Stop_UI_LowHealth_Warning_Loop','Set_State_Healthy']),
+ ('onfire', ['Play_Gore_StatusEffects_Fire_Loop_PLYR'], 'buzz', 0.4, 'B', 'Damage', 120, 15, 0, ['Stop_Gore_StatusEffects_Fire_Loop_PLYR']),
+]
+loopstarts = {n for L in LOOPS for n in L[1]}
+out = [r for r in out if r[0] not in loopstarts]
 out.sort(key=lambda r: (r[5], r[0]))
 for n, i, pr, g, sd, cg in out:
     if cg != sec: print(f'; ---- {cg}'); sec = cg
@@ -127,3 +138,10 @@ print('; ---- Cutscene markers')
 for n in cine: print(f'{cat[n]}=cine ; {n}')
 print(f'; {len(cine)} cine markers', file=sys.stderr)
 print(f'; {len(out)} events', file=sys.stderr)
+print('[Loops]')
+print('; sustained haptics. startId=group,preset,gain,side,category,periodMs,maxSec,dubMs,stop  ; name')
+print('; a group pulses every periodMs until a stop id posts, the game rumble goes quiet (rumble), or maxSec. dubMs adds a softer second beat.')
+for g, starts, pr, gn, sd, cg, per, mx, dub, stops in LOOPS:
+    st = '|'.join('rumble' if x == 'rumble' else str(cat[x]) for x in stops if x == 'rumble' or x in names)
+    for n in starts:
+        if n in names: print(f'{cat[n]}={g},{pr},{gn:g},{sd},{cg},{per},{mx},{dub},{st} ; {n}')
