@@ -19,7 +19,7 @@
 #include "MinHook.h"
 #include "winmm_names.h"
 
-#define LANTERN_VERSION "0.1.3-diag"
+#define LANTERN_VERSION "0.1.4-diag"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -412,7 +412,13 @@ static void cen_table(int t, void **vt, const char *nm)
         BYTE *f = vt[sl];
         if (f < b || f >= b + sz) break;
         int i = t * 64 + sl;
-        MH_STATUS st = MH_CreateHook(f, cen_stub_table[i], &g_cen_orig[i]);
+        MH_STATUS st;
+        if (t == 0 && sl == 20) { /* raw output candidate: arg-preserving stub that calls raw_log(rdx) */
+            st = MH_CreateHook(f, ak_stub_table[15], &g_ak_orig[15]);
+            if (st == MH_OK) { MH_EnableHook(f); L("[raw] dev.v0 slot 20 @%p routed to dumper", f); }
+            continue;
+        }
+        st = MH_CreateHook(f, cen_stub_table[i], &g_cen_orig[i]);
         if (st == MH_OK) { MH_EnableHook(f); g_cen_fn[i] = f; n++; }
         else if (st == MH_ERROR_ALREADY_CREATED) alias++;
         else L("[cen] %s slot %d @%p: %s", nm, sl, f, MH_StatusToString(st));
@@ -437,6 +443,50 @@ static void cen_report(void)
     }
 }
 
+
+/* 0.1.4: dev.v0 slot 20 is called ~250/s with an object (vtable in GameInputRedist) in rdx:
+ * almost certainly the raw output report. Dump it (log only) to find the DualSense bytes. */
+static volatile LONG g_rawCalls, g_rawDumps; static DWORD g_rawLastTick; static DWORD g_rawLastHash;
+static int user_ptr(ULONG_PTR q) { return q > 0x100000 && q < 0x7FF000000000ULL && !(q & 7); }
+static void hexline(const char *tag, int off, const BYTE *b, int n)
+{
+    char t[3 * 32 + 1]; int k = 0;
+    for (int i = 0; i < n; i++) k += sprintf(t + k, "%02X ", b[i]);
+    L("[raw] %s +%03X: %s", tag, off, t);
+}
+static void raw_log(void *rep)
+{
+    LONG n = InterlockedIncrement(&g_rawCalls);
+    if (!rep || g_rawDumps >= 120) return;
+    BYTE ob[256]; SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), rep, ob, sizeof ob, &got) || got < 64) return;
+    /* hash the object after its first 16 bytes plus whatever its pointers point at */
+    BYTE pb[8][96]; int pn = 0; ULONG_PTR pv[8]; int poff[8];
+    for (int o = 8; o < (int)got && pn < 8; o += 8) {
+        ULONG_PTR q = *(ULONG_PTR *)(ob + o); SIZE_T g2 = 0;
+        if (!user_ptr(q)) continue;
+        if (ReadProcessMemory(GetCurrentProcess(), (void *)q, pb[pn], 96, &g2) && g2 == 96) { pv[pn] = q; poff[pn] = o; pn++; }
+    }
+    DWORD h = 2166136261u;
+    for (int i = 16; i < (int)got; i++) h = (h * 16777619u) ^ ob[i];
+    for (int j = 0; j < pn; j++) for (int i = 0; i < 96; i++) h = (h * 16777619u) ^ pb[j][i];
+    DWORD now = GetTickCount();
+    if (h == g_rawLastHash || (g_rawDumps > 0 && now - g_rawLastTick < 150)) return;
+    g_rawLastHash = h; g_rawLastTick = now;
+    LONG d = InterlockedIncrement(&g_rawDumps);
+    if (d == 1) {
+        void **vt = *(void ***)rep; char t[512]; int k = 0;
+        for (int i = 0; i < 16; i++) k += sprintf(t + k, "%d:%p ", i, vt[i]);
+        L("[raw] report vtable %p: %s", vt, t);
+    }
+    L("[raw] dump %ld at call %ld, object %p, %d pointers followed", d, n, rep, pn);
+    for (int o = 0; o < 128; o += 32) hexline("obj", o, ob + o, 32);
+    for (int j = 0; j < pn; j++) {
+        char tag[32]; sprintf(tag, "obj+%02X->", poff[j]);
+        for (int o = 0; o < 96; o += 32) hexline(tag, o, pb[j] + o, 32);
+    }
+}
+
 /* Wwise: AkUniqueID of a name is FNV-1 32 of the lowercase name, so string posts map to the same ids. */
 #define AKH 4096
 static volatile LONG g_akId[AKH], g_akCnt[AKH], g_akWin[AKH], g_akUnique, g_akTotal;
@@ -453,6 +503,7 @@ static DWORD ak_fnv(const void *s, int wide)
 }
 void ak_log(int k, void *a, void *b)
 {
+    if (k == 15) { raw_log(b); return; }
     (void)b;
     DWORD id; char nm[128] = "";
     if (g_ak_kind[k] == 0) id = (DWORD)(ULONG_PTR)a;
@@ -486,7 +537,7 @@ static void ak_hook(void)
     DWORD *names = (DWORD *)(m + ed->AddressOfNames); WORD *ords = (WORD *)(m + ed->AddressOfNameOrdinals);
     DWORD *fns = (DWORD *)(m + ed->AddressOfFunctions);
     int seen = 0;
-    for (DWORD i = 0; i < ed->NumberOfNames && g_akN < 16; i++) {
+    for (DWORD i = 0; i < ed->NumberOfNames && g_akN < 15; i++) {
         const char *n = (const char *)(m + names[i]);
         if (!strstr(n, "SoundEngine@AK@@")) continue;
         if (strncmp(n, "?PostEvent@", 11) && strncmp(n, "?ExecuteActionOnEvent@", 22)) continue;
@@ -522,7 +573,7 @@ static void ak_report(void)
         g_akWin[best] = -g_akWin[best] - 1; shown++; /* hide from next pass */
     }
     for (int h = 0; h < AKH; h++) { if (g_akWin[h] < 0) g_akWin[h] = 0; else if (g_akWin[h] > 0) g_akWin[h] = 0; }
-    if (shown) L("[ak] last 5s top:%s  (unique %ld, total %ld)", buf, g_akUnique, g_akTotal);
+    if (shown) L("[ak] 2s top:%s  (unique %ld, total %ld)", buf, g_akUnique, g_akTotal);
 }
 
 static HMODULE (WINAPI *oLoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
@@ -961,6 +1012,12 @@ static DWORD WINAPI audio_thread(void *arg)
     }
 }
 
+static DWORD WINAPI ak_thread(void *arg)
+{
+    (void)arg;
+    for (;;) { Sleep(2000); ak_report(); }
+}
+
 static DWORD WINAPI stats_thread(void *arg)
 {
     (void)arg;
@@ -974,7 +1031,6 @@ static DWORD WINAPI stats_thread(void *arg)
         }
         tap_stats();
         cen_report();
-        ak_report();
         if (t == 6 && s_writes == 0 && s_ioctl == 0)
             L("[stats] no DualSense output reports seen after 35 s. The game may use another path (GameInput). Send this log.");
     }
@@ -999,6 +1055,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)
     install_hooks();
     CloseHandle(CreateThread(NULL, 0, audio_thread, NULL, 0, NULL));
     CloseHandle(CreateThread(NULL, 0, stats_thread, NULL, 0, NULL));
+    CloseHandle(CreateThread(NULL, 0, ak_thread, NULL, 0, NULL));
     CloseHandle(CreateThread(NULL, 0, gi_thread, NULL, 0, NULL));
     return TRUE;
 }
