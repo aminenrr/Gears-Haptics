@@ -19,7 +19,7 @@
 #include "MinHook.h"
 #include "winmm_names.h"
 
-#define LANTERN_VERSION "0.1.4-diag"
+#define LANTERN_VERSION "0.1.5"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -203,19 +203,27 @@ static void process_report(BYTE *b, DWORD n, const char *via)
         return;
     }
     if (b[0] != 0x02 || n < 48) return;
-    BYTE f0 = b[1];
-    if (f0 & 0x03) {
+    BYTE f0 = b[1], f2 = b[39];
+    /* 0.1.5: rumble is valid when flag0 bit0/1 (old firmware) OR flag2 (byte 39) bit 0x04,
+     * COMPATIBLE_VIBRATION2 on newer firmware. E-Day uses the second one. */
+    if ((f0 & 0x03) || (f2 & 0x04)) {
         BYTE hi = b[3], lo = b[4];             /* [3] right/light motor, [4] left/heavy motor */
+        static BYTE lastHi, lastLo; static volatile LONG motorLogs;
+        if ((hi != lastHi || lo != lastLo) && motorLogs < 400) {
+            InterlockedIncrement(&motorLogs);
+            L("[motor] low=%u high=%u (f0=%02X f2=%02X)", lo, hi, f0, f2);
+        }
+        lastHi = hi; lastLo = lo;
         g_high = hi / 255.0f; g_low = lo / 255.0f;
         if (hi || lo) { InterlockedIncrement(&s_rumble); max_store(&s_maxLow, lo); max_store(&s_maxHigh, hi); }
         if (C.enabled && g_hapticsLive && !C.keepNative) {
             b[1] = (BYTE)(f0 & ~0x03);          /* drop rumble emulation, keep trigger/light flags */
+            b[39] = (BYTE)(f2 & ~0x04);
             b[3] = 0; b[4] = 0;
             InterlockedIncrement(&s_stripped);
         }
     }
 }
-
 
 /* ---------------- GameInput rumble ----------------
  * 0.1.1 showed the game's rumble is neither in its HID reports nor an audio
