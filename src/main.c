@@ -19,7 +19,7 @@
 #include "MinHook.h"
 #include "winmm_names.h"
 
-#define LANTERN_VERSION "0.1.5"
+#define LANTERN_VERSION "0.1.6"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -52,8 +52,8 @@ static void L(const char *fmt, ...)
 }
 
 static struct {
-    int enabled, keepNative, logReports, hookWwise;
-    float strength, lowHz, highHz, lowGain, highGain, bleed, trGain, trThresh, chime;
+    int enabled, keepNative, logReports, hookWwise, logPosts, nameScan;
+    float curve, evGain, strength, lowHz, highHz, lowGain, highGain, bleed, trGain, trThresh, chime;
 } C;
 
 static wchar_t g_ini[MAX_PATH];
@@ -84,13 +84,71 @@ static const char *DEFAULT_INI =
     "LowGain=1.0\r\n"
     "HighGain=0.8\r\n"
     "; heavy plays left, light plays right; how much leaks to the other side (0..1)\r\n"
-    "SideBleed=0.35\r\n"
-    "; extra click on sudden hits (0 = off)\r\n"
-    "TransientGain=0.9\r\n"
-    "TransientThreshold=0.2\r\n"
+    "SideBleed=0.6\r\n"
+    "; boosts weak rumble: 1 = linear, 0.5 = quiet rumble felt much more, lower = stronger boost\r\n"
+    "Curve=0.5\r\n"
+    "; extra click on every rising edge of the rumble (0 = off)\r\n"
+    "TransientGain=1.0\r\n"
+    "TransientThreshold=0.04\r\n"
+    "; master gain for sound event haptics in [Events]\r\n"
+    "EventGain=1.0\r\n"
     "\r\n[Diag]\r\n"
     "; log the game's Wwise sound events (log only). Set 0 if the game crashes about 15 s after launch.\r\n"
-    "HookWwise=1\r\n";
+    "HookWwise=1\r\n"
+    "; log each Wwise event as it plays (spammy ids stop after 20 lines)\r\n"
+    "LogPosts=1\r\n"
+    "; look up event names in game memory at 1, 3 and 6 minutes, writes lantern_events.txt\r\n"
+    "NameScan=1\r\n"
+    "\r\n[Events]\r\n"
+    "; sound event haptics, allowlist only. id=preset,gain,side\r\n"
+    "; presets: tick click knock thump buzz   side: B both, L left, R right\r\n"
+    "; example: 1234567890=click,0.8,B\r\n";
+
+/* ---------------- sound event haptics (allowlist) ---------------- */
+typedef struct { const char *name; float hz, decayMs, lenMs; } Preset;
+static const Preset g_presets[] = {
+    { "tick", 230, 10, 25 }, { "click", 160, 18, 45 }, { "knock", 110, 32, 80 },
+    { "thump", 65, 70, 180 }, { "buzz", 185, 90, 140 },
+};
+#define NPRESET (int)(sizeof g_presets / sizeof g_presets[0])
+#define MAXEV 256
+static struct { DWORD id; int preset; float gain; int side; } g_ev[MAXEV];
+static int g_evN;
+static volatile LONG g_evQ[64], g_evW, g_evFired;
+
+static void load_events(void)
+{
+    static wchar_t buf[32768];
+    DWORD n = GetPrivateProfileSectionW(L"Events", buf, 32768, g_ini);
+    for (wchar_t *e = buf; n && *e && g_evN < MAXEV; e += wcslen(e) + 1) {
+        if (*e == L';') continue;
+        DWORD id = (DWORD)wcstoul(e, NULL, 10);
+        wchar_t *v = wcschr(e, L'='); if (!id || !v) continue;
+        v++;
+        wchar_t pn[16] = L""; int k = 0;
+        while (*v && *v != L',' && k < 15) pn[k++] = (wchar_t)towlower(*v++);
+        pn[k] = 0;
+        int pi = -1;
+        for (int i = 0; i < NPRESET; i++) { wchar_t w[16]; swprintf(w, 16, L"%hs", g_presets[i].name); if (!wcscmp(w, pn)) pi = i; }
+        if (pi < 0) { L("[ev] unknown preset '%ls' for %u", pn, id); continue; }
+        float gain = 1.f; int side = 0;
+        if (*v == L',') { v++; gain = (float)wcstod(v, &v); }
+        if (*v == L',') { v++; side = (*v == L'L' || *v == L'l') ? 1 : (*v == L'R' || *v == L'r') ? 2 : 0; }
+        g_ev[g_evN].id = id; g_ev[g_evN].preset = pi; g_ev[g_evN].gain = gain; g_ev[g_evN].side = side; g_evN++;
+    }
+    L("[ev] %d allowlisted sound events", g_evN);
+}
+
+/* called on the game's thread from the PostEvent hook: queue only, never block */
+static void ev_post(DWORD id)
+{
+    for (int i = 0; i < g_evN; i++) if (g_ev[i].id == id) {
+        LONG w = InterlockedIncrement(&g_evW) - 1;
+        InterlockedExchange(&g_evQ[w & 63], i + 1);
+        InterlockedIncrement(&g_evFired);
+        return;
+    }
+}
 
 static void load_config(void)
 {
@@ -103,16 +161,22 @@ static void load_config(void)
     C.keepNative = (int)ini_f(L"General", L"KeepNativeRumble", 0);
     C.logReports = (int)ini_f(L"General", L"LogReports", 200);
     C.hookWwise = (int)ini_f(L"Diag", L"HookWwise", 1);
+    C.logPosts   = (int)ini_f(L"Diag", L"LogPosts", 1);
+    C.nameScan   = (int)ini_f(L"Diag", L"NameScan", 1);
+    C.curve      = ini_f(L"Tuning", L"Curve", 0.5f);
+    C.evGain     = ini_f(L"Tuning", L"EventGain", 1.0f);
+    if (C.curve < 0.1f) C.curve = 0.1f; if (C.curve > 2.f) C.curve = 2.f;
     C.chime      = ini_f(L"General", L"Chime", 1);
     C.lowHz      = ini_f(L"Tuning", L"LowMotorHz", 75);
     C.highHz     = ini_f(L"Tuning", L"HighMotorHz", 185);
     C.lowGain    = ini_f(L"Tuning", L"LowGain", 1.0f);
     C.highGain   = ini_f(L"Tuning", L"HighGain", 0.8f);
-    C.bleed      = ini_f(L"Tuning", L"SideBleed", 0.35f);
-    C.trGain     = ini_f(L"Tuning", L"TransientGain", 0.9f);
-    C.trThresh   = ini_f(L"Tuning", L"TransientThreshold", 0.2f);
-    L("config: Enabled=%d Strength=%.2f KeepNativeRumble=%d LowHz=%.0f HighHz=%.0f LowGain=%.2f HighGain=%.2f Bleed=%.2f TrGain=%.2f TrThr=%.2f",
-      C.enabled, C.strength, C.keepNative, C.lowHz, C.highHz, C.lowGain, C.highGain, C.bleed, C.trGain, C.trThresh);
+    C.bleed      = ini_f(L"Tuning", L"SideBleed", 0.6f);
+    C.trGain     = ini_f(L"Tuning", L"TransientGain", 1.0f);
+    C.trThresh   = ini_f(L"Tuning", L"TransientThreshold", 0.04f);
+    L("config: Enabled=%d Strength=%.2f KeepNativeRumble=%d LowHz=%.0f HighHz=%.0f LowGain=%.2f HighGain=%.2f Bleed=%.2f TrGain=%.2f TrThr=%.2f Curve=%.2f EventGain=%.2f LogPosts=%d NameScan=%d",
+      C.enabled, C.strength, C.keepNative, C.lowHz, C.highHz, C.lowGain, C.highGain, C.bleed, C.trGain, C.trThresh, C.curve, C.evGain, C.logPosts, C.nameScan);
+    load_events();
 }
 
 /* ---------------- shared state ---------------- */
@@ -497,7 +561,8 @@ static void raw_log(void *rep)
 
 /* Wwise: AkUniqueID of a name is FNV-1 32 of the lowercase name, so string posts map to the same ids. */
 #define AKH 4096
-static volatile LONG g_akId[AKH], g_akCnt[AKH], g_akWin[AKH], g_akUnique, g_akTotal;
+static volatile LONG g_akId[AKH], g_akCnt[AKH], g_akWin[AKH], g_akUnique, g_akTotal, g_postLogs;
+static char *volatile g_akName[AKH];
 static DWORD ak_fnv(const void *s, int wide)
 {
     DWORD h = 2166136261u;
@@ -523,9 +588,14 @@ void ak_log(int k, void *a, void *b)
     }
     if (!id) return;
     InterlockedIncrement(&g_akTotal);
+    if (g_evN) ev_post(id);
     for (int j = 0, h = id & (AKH - 1); j < AKH; j++, h = (h + 1) & (AKH - 1)) {
         LONG cur = g_akId[h];
-        if (cur == (LONG)id) { InterlockedIncrement(&g_akCnt[h]); InterlockedIncrement(&g_akWin[h]); return; }
+        if (cur == (LONG)id) {
+            LONG c = InterlockedIncrement(&g_akCnt[h]); InterlockedIncrement(&g_akWin[h]);
+            if (C.logPosts && c <= 20 && InterlockedIncrement(&g_postLogs) <= 6000) L("[post] %u%s%s", id, g_akName[h] ? " " : "", g_akName[h] ? g_akName[h] : "");
+            return;
+        }
         if (cur == 0 && InterlockedCompareExchange(&g_akId[h], (LONG)id, 0) == 0) {
             InterlockedIncrement(&g_akCnt[h]); InterlockedIncrement(&g_akWin[h]);
             LONG u = InterlockedIncrement(&g_akUnique);
@@ -569,6 +639,97 @@ static void ak_hook(void)
     L("[ak] %d PostEvent/ExecuteActionOnEvent exports seen, %d hooked", seen, g_akN);
 }
 
+/* ---- name scan: Wwise ids are FNV-1 32 of the lowercase event name. UE keeps asset
+ * names (FName pool) in memory, so hash every identifier-like string and match. ---- */
+#define CATN (1 << 16)
+static DWORD g_catId[CATN]; static char *g_catName[CATN]; static int g_catN;
+static int ak_find(DWORD id)
+{
+    for (int j = 0, h = id & (AKH - 1); j < AKH; j++, h = (h + 1) & (AKH - 1)) {
+        if ((DWORD)g_akId[h] == id) return h;
+        if (!g_akId[h]) return -1;
+    }
+    return -1;
+}
+static int cat_prefix(const char *s, int n)
+{
+    static const char *px[] = { "play_", "stop_", "ui_", "sfx_", "mx_", "vo_", "amb_", "wpn_", "fol_" };
+    for (int i = 0; i < (int)(sizeof px / sizeof px[0]); i++) {
+        int k = (int)strlen(px[i]); if (n <= k) continue;
+        int ok = 1; for (int j = 0; j < k && ok; j++) { char c = s[j]; if (c >= 'A' && c <= 'Z') c += 32; if (c != px[i][j]) ok = 0; }
+        if (ok) return 1;
+    }
+    return 0;
+}
+static void name_hit(const char *s, int n)
+{
+    DWORD h = 2166136261u;
+    for (int i = 0; i < n; i++) { unsigned c = (unsigned char)s[i]; if (c >= 'A' && c <= 'Z') c += 32; h = (h * 16777619u) ^ c; }
+    int seen = ak_find(h);
+    if (seen >= 0 && !g_akName[seen]) {
+        char *d = malloc(n + 1); memcpy(d, s, n); d[n] = 0; g_akName[seen] = d;
+        L("[name] %u = %s (posted %ld times so far)", h, d, g_akCnt[seen]);
+    }
+    if (seen < 0 && !cat_prefix(s, n)) return;
+    for (int j = 0, k = h & (CATN - 1); j < CATN; j++, k = (k + 1) & (CATN - 1)) {
+        if (g_catId[k] == h) return;
+        if (!g_catId[k]) {
+            if (g_catN >= CATN * 3 / 4) return;
+            char *d = malloc(n + 1); memcpy(d, s, n); d[n] = 0;
+            g_catName[k] = d; g_catId[k] = h; g_catN++; return;
+        }
+    }
+}
+static void name_scan(int pass)
+{
+    DWORD t0 = GetTickCount(); SIZE_T scanned = 0; int before = g_catN;
+    static BYTE buf[(1 << 20) + 128];
+    MEMORY_BASIC_INFORMATION mi;
+    for (BYTE *a = (BYTE *)0x10000; a < (BYTE *)0x7FFFFFFF0000ULL; a = (BYTE *)mi.BaseAddress + mi.RegionSize) {
+        if (!VirtualQuery(a, &mi, sizeof mi)) break;
+        DWORD pr = mi.Protect;
+        if (mi.State != MEM_COMMIT || (pr & (PAGE_GUARD | PAGE_NOACCESS | PAGE_NOCACHE | PAGE_WRITECOMBINE))) continue;
+        if (!(pr & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) continue;
+        if (mi.Type == MEM_MAPPED || mi.RegionSize > ((SIZE_T)1 << 30)) continue;
+        for (SIZE_T off = 0; off < mi.RegionSize; off += (1 << 20)) {
+            SIZE_T want = mi.RegionSize - off; if (want > (1 << 20) + 128) want = (1 << 20) + 128;
+            if (off + want > mi.RegionSize) want = mi.RegionSize - off;
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (BYTE *)mi.BaseAddress + off, buf, want, &got) || !got) continue;
+            scanned += got;
+            int run = 0;
+            SIZE_T lim = got > (1 << 20) ? (1 << 20) : got;   /* start runs only inside the chunk, finish them in the overlap */
+            for (SIZE_T i = 0; i < got; i++) {
+                BYTE c = buf[i];
+                int idc = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+                if (idc) { if (run || i < lim) run++; if (run > 100) run = 101; continue; }
+                if (run >= 5 && run <= 100) name_hit((const char *)buf + i - run, run);
+                run = 0;
+                if (i >= lim) break;
+            }
+        }
+        Sleep(0);
+    }
+    int named = 0; for (int h = 0; h < AKH; h++) if (g_akId[h] && g_akName[h]) named++;
+    L("[name] scan %d: %.0f MB in %lu ms, %d of %ld posted ids named, catalog %d (+%d)", pass, scanned / 1048576.0, GetTickCount() - t0, named, g_akUnique, g_catN, g_catN - before);
+    wchar_t p[MAX_PATH]; wcscpy(p, g_dir); wcscat(p, L"lantern_events.txt");
+    FILE *f = _wfopen(p, L"w");
+    if (!f) return;
+    fprintf(f, "# lantern %s event catalog, scan %d. id, times posted this session, name\n", LANTERN_VERSION, pass);
+    for (int k = 0; k < CATN; k++) if (g_catId[k]) { int s2 = ak_find(g_catId[k]); fprintf(f, "%u\t%ld\t%s\n", g_catId[k], s2 >= 0 ? g_akCnt[s2] : 0L, g_catName[k]); }
+    for (int h = 0; h < AKH; h++) if (g_akId[h] && !g_akName[h]) fprintf(f, "%u\t%ld\t?\n", (DWORD)g_akId[h], g_akCnt[h]);
+    fclose(f);
+}
+static DWORD WINAPI scan_thread(void *arg)
+{
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    static const DWORD at[3] = { 60000, 180000, 360000 };
+    DWORD last = 0;
+    for (int i = 0; i < 3; i++) { Sleep(at[i] - last); last = at[i]; name_scan(i + 1); }
+    return 0;
+}
+
 static void ak_report(void)
 {
     if (!g_akN) return;
@@ -603,7 +764,7 @@ static DWORD WINAPI gi_thread(void *arg)
         if (!m) m = GetModuleHandleW(L"GameInput.dll");
         if (m) gi_hook_module(m, L"(found loaded)");
         xi_scan();
-        if (t == 15 && C.hookWwise) ak_hook();
+        if (t == 15 && C.hookWwise) { ak_hook(); if (g_akN && C.nameScan) CloseHandle(CreateThread(NULL, 0, scan_thread, NULL, 0, NULL)); }
         if (pGICreate || pGIInit) {
             int pending = 0;
             for (int v = 0; v < 5; v++) if (g_giHooked[v] == 0) pending = 1;
@@ -900,13 +1061,28 @@ static IMMDevice *find_ds_endpoint(IMMDeviceEnumerator *en, wchar_t *nameOut)
     return found;
 }
 
-typedef struct { double phL, phH, phT; float low, high, tr, lastSum; int chime; } Synth;
+typedef struct { double ph; float amp, decay, hz; int left, side; } Voice;
+typedef struct { double phL, phH, phT; float low, high, tr, lastSum; int chime; LONG evR; Voice v[8]; } Synth;
 
 static void synth_fill(Synth *S, BYTE *out, UINT frames, int ch, int isFloat, int bits, int iL, int iR, int sr)
 {
     float str = C.enabled ? C.strength : 0.f;
     float tl = g_low, th = g_high;
+    if (tl > 0) tl = powf(tl, C.curve);
+    if (th > 0) th = powf(th, C.curve);
     float sum = tl + th;
+    /* start queued sound event voices */
+    while (S->evR < g_evW) {
+        LONG e = InterlockedExchange(&g_evQ[S->evR & 63], 0);
+        if (!e) break;
+        S->evR++;
+        int ei = e - 1, slot = 0;
+        for (int k = 1; k < 8; k++) if (S->v[k].left < S->v[slot].left) slot = k;
+        const Preset *pr = &g_presets[g_ev[ei].preset];
+        Voice *vo = &S->v[slot];
+        vo->ph = 0; vo->hz = pr->hz; vo->amp = g_ev[ei].gain * C.evGain;
+        vo->decay = expf(-1.f / (sr * pr->decayMs / 1000.f)); vo->left = (int)(sr * pr->lenMs / 1000.f); vo->side = g_ev[ei].side;
+    }
     if (sum - S->lastSum > C.trThresh) { S->tr += (sum - S->lastSum) * C.trGain; if (S->tr > 1) S->tr = 1; }
     S->lastSum = sum;
     float atk = 1.f - expf(-1.f / (sr * 0.004f));
@@ -924,9 +1100,20 @@ static void synth_fill(Synth *S, BYTE *out, UINT frames, int ch, int isFloat, in
         float sH = (float)sin(S->phH) * S->high * C.highGain;
         float sT = (float)sin(S->phT) * S->tr;
         S->tr *= trDecay;
+        float eL = 0, eR = 0;
+        for (int k = 0; k < 8; k++) {
+            Voice *vo = &S->v[k];
+            if (vo->left <= 0) continue;
+            vo->left--;
+            vo->ph += 2 * M_PI * vo->hz / sr;
+            float x = (float)sin(vo->ph) * vo->amp;
+            vo->amp *= vo->decay;
+            if (vo->side != 2) eL += x;
+            if (vo->side != 1) eR += x;
+        }
         if (S->chime > 0) { sT += (float)sin(S->phH * 1.3) * 0.5f; S->chime--; }
-        float left = tanhf((sL + sH * C.bleed + sT) * str * 1.4f);
-        float right = tanhf((sH + sL * C.bleed + sT) * str * 1.4f);
+        float left = tanhf((sL + sH * C.bleed + sT + eL) * str * 1.4f);
+        float right = tanhf((sH + sL * C.bleed + sT + eR) * str * 1.4f);
         if (isFloat) {
             float *f = (float *)out + (size_t)i * ch;
             for (int c = 0; c < ch; c++) f[c] = 0.f;
@@ -1035,6 +1222,7 @@ static DWORD WINAPI stats_thread(void *arg)
         if (s_writes != lw || s_ioctl != li || s_giRumble || t % 12 == 0) {
             L("[stats] writes=%ld ioctl=%ld hidRumble=%ld giRumble=%ld giNonZero=%ld giRaw=%ld xi=%ld xiNonZero=%ld stripped=%ld bt=%ld maxLow=%ld maxHigh=%ld haptics=%s",
               s_writes, s_ioctl, s_rumble, s_giRumble, s_giRumbleNZ, s_giRaw, s_xi, s_xiNZ, s_stripped, s_bt, s_maxLow, s_maxHigh, g_hapticsLive ? "on" : "off");
+            if (g_evN) L("[stats] sound event haptics fired: %ld", g_evFired);
             lw = s_writes; li = s_ioctl;
         }
         tap_stats();
