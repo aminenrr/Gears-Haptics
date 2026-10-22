@@ -20,7 +20,7 @@
 #include "winmm_names.h"
 #include "events_default.h"
 
-#define LANTERN_VERSION "0.2.2"
+#define LANTERN_VERSION "0.2.3"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -96,12 +96,12 @@ static const char *DEFAULT_INI =
     "EventGain=1.0\r\n"
 
     "\r\n[Diag]\r\n"
-    "; log the game's Wwise sound events (log only). Set 0 if the game crashes about 15 s after launch.\r\n"
+    "; hook the game's Wwise sound engine (needed for sound haptics). Set 0 if the game crashes about 15 s after launch.\r\n"
     "HookWwise=1\r\n"
     "; log each Wwise event as it plays (spammy ids stop after 20 lines)\r\n"
-    "LogPosts=1\r\n"
-    "; look up event names in game memory at 1, 3 and 6 minutes, writes GearsHaptics_catalog.txt\r\n"
-    "NameScan=1\r\n"
+    "LogPosts=0\r\n"
+    "; for mapping new sounds: look up event names in game memory at 1, 3 and 6 minutes, writes GearsHaptics_catalog.txt (can stutter while it runs)\r\n"
+    "NameScan=0\r\n"
     "; the sound event list lives in GearsHaptics_events.ini next to this file\r\n";
 
 /* added to an older GearsHaptics.ini that has no [Sound] section yet */
@@ -294,8 +294,8 @@ static void load_config(void)
     C.keepNative = (int)ini_f(L"General", L"KeepNativeRumble", 0);
     C.logReports = (int)ini_f(L"General", L"LogReports", 200);
     C.hookWwise = (int)ini_f(L"Diag", L"HookWwise", 1);
-    C.logPosts   = (int)ini_f(L"Diag", L"LogPosts", 1);
-    C.nameScan   = (int)ini_f(L"Diag", L"NameScan", 1);
+    C.logPosts   = (int)ini_f(L"Diag", L"LogPosts", 0);
+    C.nameScan   = (int)ini_f(L"Diag", L"NameScan", 0);
     C.curve      = ini_f(L"Tuning", L"Curve", 0.5f);
     C.evGain     = ini_f(L"Tuning", L"EventGain", 1.0f);
     C.cineMute   = (int)ini_f(L"Sound", L"CutsceneMute", 1);
