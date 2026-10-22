@@ -19,7 +19,7 @@
 #include "MinHook.h"
 #include "winmm_names.h"
 
-#define LANTERN_VERSION "0.1.0-p1"
+#define LANTERN_VERSION "0.1.1-diag"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -74,7 +74,7 @@ static const char *DEFAULT_INI =
     "; 1 = also keep the game's own rumble (not recommended)\r\n"
     "KeepNativeRumble=0\r\n"
     "; how many raw DualSense reports to write to the log (for debugging)\r\n"
-    "LogReports=40\r\n"
+    "LogReports=200\r\n"
     "; short pulse when haptics connect (0 = off)\r\n"
     "Chime=1\r\n"
     "\r\n[Tuning]\r\n"
@@ -98,7 +98,7 @@ static void load_config(void)
     C.enabled    = (int)ini_f(L"General", L"Enabled", 1);
     C.strength   = ini_f(L"General", L"Strength", 1.0f);
     C.keepNative = (int)ini_f(L"General", L"KeepNativeRumble", 0);
-    C.logReports = (int)ini_f(L"General", L"LogReports", 40);
+    C.logReports = (int)ini_f(L"General", L"LogReports", 200);
     C.chime      = ini_f(L"General", L"Chime", 1);
     C.lowHz      = ini_f(L"Tuning", L"LowMotorHz", 75);
     C.highHz     = ini_f(L"Tuning", L"HighMotorHz", 185);
@@ -179,8 +179,8 @@ static int handle_is_ds(HANDLE h)
 
 static void hexlog(const char *tag, const BYTE *b, DWORD n)
 {
-    char s[3 * 24 + 1]; int k = 0;
-    for (DWORD i = 0; i < n && i < 24; i++) k += sprintf(s + k, "%02X ", b[i]);
+    char s[3 * 64 + 1]; int k = 0;
+    for (DWORD i = 0; i < n && i < 64; i++) k += sprintf(s + k, "%02X ", b[i]);
     s[k] = 0;
     L("%s len=%lu: %s", tag, n, s);
 }
@@ -188,9 +188,11 @@ static void hexlog(const char *tag, const BYTE *b, DWORD n)
 static void max_store(volatile LONG *m, LONG v) { LONG o; while ((o = *m) < v && InterlockedCompareExchange(m, v, o) != o) {} }
 
 /* b is the game's own buffer; motor bytes are edited in place. */
+static BYTE g_lastRep[64];
 static void process_report(BYTE *b, DWORD n, const char *via)
 {
-    if (s_logged < C.logReports) { InterlockedIncrement(&s_logged); hexlog(via, b, n); }
+    DWORD cn = n > 64 ? 64 : n;
+    if (s_logged < C.logReports && memcmp(g_lastRep, b, cn) != 0) { InterlockedIncrement(&s_logged); memcpy(g_lastRep, b, cn); hexlog(via, b, n); }
     if (n < 1) return;
     if (b[0] == 0x31) {                         /* Bluetooth report, haptics need USB */
         if (InterlockedIncrement(&s_bt) == 1) L("[hid] Bluetooth output reports seen. Haptics only work over USB: unplug Bluetooth, use the cable.");
@@ -298,6 +300,168 @@ static void install_hooks(void)
     hook(kb, "CloseHandle", hCloseHandle, (void **)&oCloseHandle);
 }
 
+
+/* ---------------- game audio stream tap (diagnostic, log only) ----------------
+ * Hypothesis: the game makes its DualSense rumble as audio on the controller's
+ * own endpoint (channels 3/4), not in HID reports. Watch only streams opened on
+ * the controller endpoint (or on an unknown device with 4+ channels) and log
+ * per channel peaks. Nothing here touches the coils or the game's audio. */
+#define MAXS 32
+typedef struct {
+    void *client, *render; int ds, known, ch, bits, isFloat; DWORD mask; BYTE *buf;
+    volatile LONG nbuf, nsilent; float peak[8]; wchar_t dev[96];
+} Stream;
+static Stream g_s[MAXS];
+static SRWLOCK g_sLock = SRWLOCK_INIT;
+static void *g_ourClient, *g_ourRender;
+
+static Stream *s_find(void *client, void *render, int create)
+{
+    Stream *r = NULL;
+    AcquireSRWLockExclusive(&g_sLock);
+    for (int i = 0; i < MAXS && !r; i++)
+        if ((client && g_s[i].client == client) || (render && g_s[i].render == render)) r = &g_s[i];
+    if (!r && create) for (int i = 0; i < MAXS && !r; i++) if (!g_s[i].client) { r = &g_s[i]; memset(r, 0, sizeof(*r)); r->client = client; }
+    ReleaseSRWLockExclusive(&g_sLock);
+    return r;
+}
+
+static HRESULT (STDMETHODCALLTYPE *oActivate)(IMMDevice *, REFIID, DWORD, PROPVARIANT *, void **);
+static HRESULT (STDMETHODCALLTYPE *oInit)(IAudioClient *, AUDCLNT_SHAREMODE, DWORD, REFERENCE_TIME, REFERENCE_TIME, const WAVEFORMATEX *, LPCGUID);
+static HRESULT (STDMETHODCALLTYPE *oGetService)(IAudioClient *, REFIID, void **);
+static HRESULT (STDMETHODCALLTYPE *oGetBuffer)(IAudioRenderClient *, UINT32, BYTE **);
+static HRESULT (STDMETHODCALLTYPE *oRelBuffer)(IAudioRenderClient *, UINT32, DWORD);
+
+static void dev_name(IMMDevice *d, wchar_t *out, int n)
+{
+    out[0] = 0;
+    IPropertyStore *ps = NULL;
+    if (SUCCEEDED(d->lpVtbl->OpenPropertyStore(d, STGM_READ, &ps))) {
+        PROPVARIANT v; PropVariantInit(&v);
+        if (SUCCEEDED(ps->lpVtbl->GetValue(ps, &PKEY_Device_FriendlyName, &v)) && v.vt == VT_LPWSTR) { wcsncpy(out, v.pwszVal, n - 1); out[n - 1] = 0; }
+        PropVariantClear(&v);
+        ps->lpVtbl->Release(ps);
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE hActivate(IMMDevice *d, REFIID riid, DWORD ctx, PROPVARIANT *pa, void **out)
+{
+    HRESULT hr = oActivate(d, riid, ctx, pa, out);
+    if (SUCCEEDED(hr) && out && *out && !t_inHook) {
+        wchar_t nm[96]; t_inHook++; dev_name(d, nm, 96); t_inHook--;
+        int isClient = IsEqualIID(riid, &IID_IAudioClient);
+#ifdef __IAudioClient2_INTERFACE_DEFINED__
+        isClient |= IsEqualIID(riid, &IID_IAudioClient2);
+#endif
+#ifdef __IAudioClient3_INTERFACE_DEFINED__
+        isClient |= IsEqualIID(riid, &IID_IAudioClient3);
+#endif
+        L("[tap] game Activate on \"%ls\" -> %p%s", nm, *out, isClient ? " (audio client)" : "");
+        if (isClient) {
+            Stream *st = s_find(*out, NULL, 1);
+            if (st) { st->known = 1; st->ds = wcsstr(nm, L"Wireless Controller") != NULL; wcsncpy(st->dev, nm, 95); }
+        }
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hInit(IAudioClient *c, AUDCLNT_SHAREMODE sm, DWORD fl, REFERENCE_TIME dur, REFERENCE_TIME per, const WAVEFORMATEX *wf, LPCGUID sess)
+{
+    HRESULT hr = oInit(c, sm, fl, dur, per, wf, sess);
+    if ((void *)c != g_ourClient && wf) {
+        Stream *st = s_find(c, NULL, 1);
+        if (st) {
+            st->ch = wf->nChannels; st->bits = wf->wBitsPerSample; st->isFloat = wf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT; st->mask = 0;
+            if (wf->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+                const WAVEFORMATEXTENSIBLE *x = (const WAVEFORMATEXTENSIBLE *)wf;
+                st->mask = x->dwChannelMask; st->isFloat = IsEqualGUID(&x->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+            }
+            L("[tap] Initialize client %p dev=\"%ls\" %s flags=0x%lX %lu Hz %d ch %d bit %s mask 0x%lX -> 0x%08lX",
+              c, st->known ? st->dev : L"(unknown, not via IMMDevice)", sm == AUDCLNT_SHAREMODE_EXCLUSIVE ? "EXCLUSIVE" : "shared", fl,
+              wf->nSamplesPerSec, wf->nChannels, wf->wBitsPerSample, st->isFloat ? "float" : "pcm", st->mask, hr);
+        }
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hGetService(IAudioClient *c, REFIID riid, void **out)
+{
+    HRESULT hr = oGetService(c, riid, out);
+    if (SUCCEEDED(hr) && out && *out && (void *)c != g_ourClient && IsEqualIID(riid, &IID_IAudioRenderClient)) {
+        Stream *st = s_find(c, NULL, 0);
+        if (st) { st->render = *out; L("[tap] render client %p for client %p (%ls)", *out, c, st->known ? st->dev : L"unknown dev"); }
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hGetBuffer(IAudioRenderClient *r, UINT32 n, BYTE **pp)
+{
+    HRESULT hr = oGetBuffer(r, n, pp);
+    if (SUCCEEDED(hr) && (void *)r != g_ourRender && pp) {
+        Stream *st = s_find(NULL, r, 0);
+        if (st) st->buf = *pp;
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hRelBuffer(IAudioRenderClient *r, UINT32 n, DWORD fl)
+{
+    if ((void *)r != g_ourRender) {
+        Stream *st = s_find(NULL, r, 0);
+        /* only the controller endpoint, or an unknown device with 4+ channels */
+        if (st && st->buf && n && (st->ds || (!st->known && st->ch >= 4))) {
+            InterlockedIncrement(&st->nbuf);
+            if (fl & AUDCLNT_BUFFERFLAGS_SILENT) InterlockedIncrement(&st->nsilent);
+            else {
+                int ch = st->ch > 8 ? 8 : st->ch;
+                for (UINT32 i = 0; i < n; i++) for (int c = 0; c < ch; c++) {
+                    float v = 0;
+                    if (st->isFloat && st->bits == 32) v = ((float *)st->buf)[(size_t)i * st->ch + c];
+                    else if (st->bits == 16) v = ((short *)st->buf)[(size_t)i * st->ch + c] / 32768.f;
+                    else if (st->bits == 32) v = ((int *)st->buf)[(size_t)i * st->ch + c] / 2147483648.f;
+                    v = fabsf(v); if (v > st->peak[c]) st->peak[c] = v;
+                }
+            }
+        }
+    }
+    return oRelBuffer(r, n, fl);
+}
+
+static void tap_stats(void)
+{
+    for (int i = 0; i < MAXS; i++) {
+        Stream *st = &g_s[i];
+        if (!st->client || !st->nbuf) continue;
+        char pk[128]; int k = 0;
+        for (int c = 0; c < st->ch && c < 8; c++) { k += sprintf(pk + k, "ch%d=%.3f ", c + 1, st->peak[c]); st->peak[c] = 0; }
+        L("[tap] stream %p (%ls) buffers=%ld silent=%ld peaks: %s", st->client, st->known ? st->dev : L"unknown dev", st->nbuf, st->nsilent, pk);
+        st->nbuf = 0; st->nsilent = 0;
+    }
+}
+
+static void install_audio_hooks(IMMDeviceEnumerator *en)
+{
+    IMMDevice *d = NULL; IAudioClient *c = NULL; IAudioRenderClient *r = NULL; WAVEFORMATEX *wf = NULL;
+    if (FAILED(en->lpVtbl->GetDefaultAudioEndpoint(en, eRender, eConsole, &d))) { L("[tap] no default endpoint, tap off"); return; }
+    void *fAct = d->lpVtbl->Activate;
+    if (SUCCEEDED(d->lpVtbl->Activate(d, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&c)) && SUCCEEDED(c->lpVtbl->GetMixFormat(c, &wf)) &&
+        SUCCEEDED(c->lpVtbl->Initialize(c, AUDCLNT_SHAREMODE_SHARED, 0, 300000, 0, wf, NULL)) &&
+        SUCCEEDED(c->lpVtbl->GetService(c, &IID_IAudioRenderClient, (void **)&r))) {
+        int ok = 1;
+        ok &= MH_CreateHook(fAct, hActivate, (void **)&oActivate) == MH_OK;
+        ok &= MH_CreateHook(c->lpVtbl->Initialize, hInit, (void **)&oInit) == MH_OK;
+        ok &= MH_CreateHook(c->lpVtbl->GetService, hGetService, (void **)&oGetService) == MH_OK;
+        ok &= MH_CreateHook(r->lpVtbl->GetBuffer, hGetBuffer, (void **)&oGetBuffer) == MH_OK;
+        ok &= MH_CreateHook(r->lpVtbl->ReleaseBuffer, hRelBuffer, (void **)&oRelBuffer) == MH_OK;
+        MH_STATUS e = MH_EnableHook(MH_ALL_HOOKS);
+        L("[tap] audio hooks: create %s, enable %s", ok ? "ok" : "FAILED", MH_StatusToString(e));
+    } else L("[tap] could not build a probe client, tap off");
+    if (r) r->lpVtbl->Release(r);
+    if (wf) CoTaskMemFree(wf);
+    if (c) c->lpVtbl->Release(c);
+    d->lpVtbl->Release(d);
+}
+
 /* ---------------- haptic synth (WASAPI) ---------------- */
 #define SPK_BL 0x10
 #define SPK_BR 0x20
@@ -383,7 +547,11 @@ static int run_stream(IMMDeviceEnumerator *en)
     IMMDevice *dev = find_ds_endpoint(en, name);
     if (!dev) return 0;
     IAudioClient *ac = NULL; IAudioRenderClient *rc = NULL; WAVEFORMATEX *mix = NULL; int ok = 0;
-    if (FAILED(IMMDevice_Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&ac))) goto done;
+    t_inHook++;
+    HRESULT ahr = IMMDevice_Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&ac);
+    t_inHook--;
+    if (FAILED(ahr)) goto done;
+    g_ourClient = ac;
     if (FAILED(IAudioClient_GetMixFormat(ac, &mix))) goto done;
     int ch = mix->nChannels, sr = mix->nSamplesPerSec, bits = mix->wBitsPerSample, isFloat = 0;
     DWORD mask = 0;
@@ -403,6 +571,7 @@ static int run_stream(IMMDeviceEnumerator *en)
     HRESULT hr = IAudioClient_Initialize(ac, AUDCLNT_SHAREMODE_SHARED, 0, dur, 0, mix, NULL);
     if (FAILED(hr)) { L("[audio] Initialize failed 0x%08lX", hr); goto done; }
     if (FAILED(IAudioClient_GetService(ac, &IID_IAudioRenderClient, (void **)&rc))) goto done;
+    g_ourRender = rc;
     UINT32 bufFrames = 0; IAudioClient_GetBufferSize(ac, &bufFrames);
     Synth S = {0};
     if (C.chime > 0) S.chime = (int)(sr * 0.12f);
@@ -441,6 +610,7 @@ static DWORD WINAPI audio_thread(void *arg)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     IMMDeviceEnumerator *en = NULL;
     if (FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void **)&en))) { L("[audio] no device enumerator"); return 0; }
+    install_audio_hooks(en);
     int warned = 0;
     for (;;) {
         if (!run_stream(en) && !warned) { warned = 1; L("[audio] DualSense audio endpoint not found yet. Plug the controller in by USB. Native rumble stays on until then."); }
@@ -459,6 +629,7 @@ static DWORD WINAPI stats_thread(void *arg)
               s_writes, s_ioctl, s_rumble, s_stripped, s_bt, s_maxLow, s_maxHigh, g_hapticsLive ? "on" : "off");
             lw = s_writes; li = s_ioctl;
         }
+        tap_stats();
         if (t == 6 && s_writes == 0 && s_ioctl == 0)
             L("[stats] no DualSense output reports seen after 35 s. The game may use another path (GameInput). Send this log.");
     }
