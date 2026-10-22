@@ -20,7 +20,7 @@
 #include "winmm_names.h"
 #include "events_default.h"
 
-#define LANTERN_VERSION "0.1.7"
+#define LANTERN_VERSION "0.1.8"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -54,7 +54,8 @@ static void L(const char *fmt, ...)
 
 static struct {
     int enabled, keepNative, logReports, hookWwise, logPosts, nameScan;
-    float curve, evGain, strength, lowHz, highHz, lowGain, highGain, bleed, trGain, trThresh, chime;
+    float curve, evGain, cineHold; int cineMute;
+    float strength, lowHz, highHz, lowGain, highGain, bleed, trGain, trThresh, chime;
 } C;
 
 static wchar_t g_ini[MAX_PATH];
@@ -91,8 +92,9 @@ static const char *DEFAULT_INI =
     "; extra click on every rising edge of the rumble (0 = off)\r\n"
     "TransientGain=1.0\r\n"
     "TransientThreshold=0.04\r\n"
-    "; master gain for sound event haptics in [Events]\r\n"
+    "; master gain for all sound event haptics\r\n"
     "EventGain=1.0\r\n"
+
     "\r\n[Diag]\r\n"
     "; log the game's Wwise sound events (log only). Set 0 if the game crashes about 15 s after launch.\r\n"
     "HookWwise=1\r\n"
@@ -102,15 +104,53 @@ static const char *DEFAULT_INI =
     "NameScan=1\r\n"
     "; sound event haptics live in lantern_events.ini next to this file\r\n";
 
+/* added to an older lantern.ini that has no [Sound] section yet */
+static const char *DEFAULT_SOUND_INI =
+    "\r\n[Sound]\r\n"
+    "; strength per kind of sound haptic (0 = off, 1 = default, up to 2)\r\n"
+    "Boots=0.6\r\n"
+    "Guns=1.0\r\n"
+    "Reload=1.0\r\n"
+    "Melee=1.0\r\n"
+    "Grenade=1.0\r\n"
+    "Chainsaw=1.0\r\n"
+    "; cover slams, mantles, rolls, slides, crouch, hand grabs\r\n"
+    "Body=1.0\r\n"
+    "; getting hurt and going down\r\n"
+    "Damage=1.0\r\n"
+    "; ammo, weapons and collectibles\r\n"
+    "Pickups=1.0\r\n"
+    "; doors, chests, E-holes, screen shake, explosions\r\n"
+    "World=1.0\r\n"
+    "; hit marker, active reload, low health, objectives\r\n"
+    "HUD=1.0\r\n"
+    "Menus=1.0\r\n"
+    "; 1 = no sound haptics during cutscenes (menus still click). Rumble from the game is kept.\r\n"
+    "CutsceneMute=1\r\n"
+    "; seconds after the last cutscene sound before sound haptics come back\r\n"
+    "CutsceneHoldSec=8\r\n"
+    "\r\n[Presets]\r\n"
+    "; shape of each haptic: frequency Hz, decay ms, length ms\r\n"
+    "tick=230,10,25\r\n"
+    "click=160,18,45\r\n"
+    "knock=110,32,80\r\n"
+    "thump=65,70,180\r\n"
+    "buzz=185,90,140\r\n";
+
 /* ---------------- sound event haptics (allowlist) ---------------- */
 typedef struct { const char *name; float hz, decayMs, lenMs; } Preset;
-static const Preset g_presets[] = {
+static Preset g_presets[] = {
     { "tick", 230, 10, 25 }, { "click", 160, 18, 45 }, { "knock", 110, 32, 80 },
     { "thump", 65, 70, 180 }, { "buzz", 185, 90, 140 },
 };
 #define NPRESET (int)(sizeof g_presets / sizeof g_presets[0])
 #define MAXEV 2048
-static struct { DWORD id; int preset; float gain; int side; } g_ev[MAXEV];
+static struct { DWORD id; int preset; float gain; int side; int cat; } g_ev[MAXEV];
+static const wchar_t *g_catNames[] = { L"Boots", L"Guns", L"Reload", L"Melee", L"Grenade", L"Chainsaw", L"Body", L"Damage", L"Pickups", L"World", L"HUD", L"Menus" };
+#define NCAT (int)(sizeof g_catNames / sizeof g_catNames[0])
+#define CAT_MENUS (NCAT - 1)
+#define PRESET_CINE 99
+static volatile ULONGLONG g_cineUntil;
 static int g_evN;
 static volatile LONG g_evQ[64], g_evW, g_evFired;
 
@@ -118,6 +158,17 @@ static void load_events(void)
 {
     static wchar_t buf[262144];
     wchar_t evp[MAX_PATH]; wcscpy(evp, g_dir); wcscat(evp, L"lantern_events.ini");
+    {   /* replace an events file from an older version (keeps it as lantern_events.old.ini) */
+        HANDLE h = CreateFileW(evp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            char hd[512] = ""; DWORD r = 0; ReadFile(h, hd, sizeof hd - 1, &r, NULL); hd[r] = 0; CloseHandle(h);
+            if (!strstr(hd, "format 2")) {
+                wchar_t old[MAX_PATH]; wcscpy(old, g_dir); wcscat(old, L"lantern_events.old.ini");
+                MoveFileExW(evp, old, MOVEFILE_REPLACE_EXISTING);
+                L("[ev] old lantern_events.ini kept as lantern_events.old.ini, writing the new defaults");
+            }
+        }
+    }
     if (GetFileAttributesW(evp) == INVALID_FILE_ATTRIBUTES) {
         HANDLE h = CreateFileW(evp, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
         if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, DEFAULT_EVENTS_INI, (DWORD)strlen(DEFAULT_EVENTS_INI), &w, NULL); CloseHandle(h); }
@@ -132,12 +183,22 @@ static void load_events(void)
         while (*v && *v != L',' && k < 15) pn[k++] = (wchar_t)towlower(*v++);
         pn[k] = 0;
         int pi = -1;
+        if (!wcscmp(pn, L"cine")) pi = PRESET_CINE;
         for (int i = 0; i < NPRESET; i++) { wchar_t w[16]; swprintf(w, 16, L"%hs", g_presets[i].name); if (!wcscmp(w, pn)) pi = i; }
         if (pi < 0) { L("[ev] unknown preset '%ls' for %u", pn, id); continue; }
         float gain = 1.f; int side = 0;
         if (*v == L',') { v++; gain = (float)wcstod(v, &v); }
-        if (*v == L',') { v++; side = (*v == L'L' || *v == L'l') ? 1 : (*v == L'R' || *v == L'r') ? 2 : (*v == L'A' || *v == L'a') ? 3 : 0; }
-        g_ev[g_evN].id = id; g_ev[g_evN].preset = pi; g_ev[g_evN].gain = gain; g_ev[g_evN].side = side; g_evN++;
+        if (*v == L',') { v++; side = (*v == L'L' || *v == L'l') ? 1 : (*v == L'R' || *v == L'r') ? 2 : (*v == L'A' || *v == L'a') ? 3 : 0; while (*v && *v != L',') v++; }
+        int cat = -1;
+        if (*v == L',') {
+            v++; wchar_t cn[24]; int q = 0;
+            while (*v && *v != L' ' && *v != L';' && *v != L',' && q < 23) cn[q++] = *v++;
+            cn[q] = 0;
+            for (int c = 0; c < NCAT; c++) if (!_wcsicmp(cn, g_catNames[c])) cat = c;
+        }
+        if (cat >= 0) { float cg = ini_f(L"Sound", g_catNames[cat], cat == 0 ? 0.6f : 1.0f); if (cg < 0) cg = 0; if (cg > 2) cg = 2; gain *= cg; }
+        if (pi != PRESET_CINE && gain <= 0) continue;
+        g_ev[g_evN].id = id; g_ev[g_evN].preset = pi; g_ev[g_evN].gain = gain; g_ev[g_evN].side = side; g_ev[g_evN].cat = cat; g_evN++;
     }
     L("[ev] %d allowlisted sound events", g_evN);
 }
@@ -146,6 +207,8 @@ static void load_events(void)
 static void ev_post(DWORD id)
 {
     for (int i = 0; i < g_evN; i++) if (g_ev[i].id == id) {
+        if (g_ev[i].preset == PRESET_CINE) { if (C.cineMute) g_cineUntil = GetTickCount64() + (ULONGLONG)(C.cineHold * 1000); return; }
+        if (C.cineMute && g_ev[i].cat != CAT_MENUS && GetTickCount64() < g_cineUntil) return;
         LONG w = InterlockedIncrement(&g_evW) - 1;
         InterlockedExchange(&g_evQ[w & 63], i + 1);
         InterlockedIncrement(&g_evFired);
@@ -159,6 +222,13 @@ static void load_config(void)
         HANDLE h = CreateFileW(g_ini, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
         if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, DEFAULT_INI, (DWORD)strlen(DEFAULT_INI), &w, NULL); CloseHandle(h); }
     }
+    {
+        wchar_t t[64];
+        if (!GetPrivateProfileSectionW(L"Sound", t, 64, g_ini)) {
+            HANDLE h = CreateFileW(g_ini, FILE_APPEND_DATA, 0, NULL, OPEN_EXISTING, 0, NULL);
+            if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, "\r\n", 2, &w, NULL); WriteFile(h, DEFAULT_SOUND_INI, (DWORD)strlen(DEFAULT_SOUND_INI), &w, NULL); CloseHandle(h); }
+        }
+    }
     C.enabled    = (int)ini_f(L"General", L"Enabled", 1);
     C.strength   = ini_f(L"General", L"Strength", 1.0f);
     C.keepNative = (int)ini_f(L"General", L"KeepNativeRumble", 0);
@@ -168,6 +238,17 @@ static void load_config(void)
     C.nameScan   = (int)ini_f(L"Diag", L"NameScan", 1);
     C.curve      = ini_f(L"Tuning", L"Curve", 0.5f);
     C.evGain     = ini_f(L"Tuning", L"EventGain", 1.0f);
+    C.cineMute   = (int)ini_f(L"Sound", L"CutsceneMute", 1);
+    C.cineHold   = ini_f(L"Sound", L"CutsceneHoldSec", 8);
+    for (int i = 0; i < NPRESET; i++) {
+        wchar_t key[16], d[64], b[64]; swprintf(key, 16, L"%hs", g_presets[i].name);
+        swprintf(d, 64, L"%g,%g,%g", g_presets[i].hz, g_presets[i].decayMs, g_presets[i].lenMs);
+        GetPrivateProfileStringW(L"Presets", key, d, b, 64, g_ini);
+        float hz, de, le;
+        if (swscanf(b, L"%f,%f,%f", &hz, &de, &le) == 3 && hz >= 20 && hz <= 1000 && de > 0 && le > 0 && le <= 2000) {
+            g_presets[i].hz = hz; g_presets[i].decayMs = de; g_presets[i].lenMs = le;
+        }
+    }
     if (C.curve < 0.1f) C.curve = 0.1f; if (C.curve > 2.f) C.curve = 2.f;
     C.chime      = ini_f(L"General", L"Chime", 1);
     C.lowHz      = ini_f(L"Tuning", L"LowMotorHz", 75);
@@ -566,6 +647,7 @@ static void raw_log(void *rep)
 #define AKH 4096
 static volatile LONG g_akId[AKH], g_akCnt[AKH], g_akWin[AKH], g_akUnique, g_akTotal, g_postLogs;
 static char *volatile g_akName[AKH];
+static volatile LONG g_akCine[AKH];
 static DWORD ak_fnv(const void *s, int wide)
 {
     DWORD h = 2166136261u;
@@ -596,6 +678,7 @@ void ak_log(int k, void *a, void *b)
         LONG cur = g_akId[h];
         if (cur == (LONG)id) {
             LONG c = InterlockedIncrement(&g_akCnt[h]); InterlockedIncrement(&g_akWin[h]);
+            if (g_akCine[h] && C.cineMute) g_cineUntil = GetTickCount64() + (ULONGLONG)(C.cineHold * 1000);
             if (C.logPosts && c <= 20 && InterlockedIncrement(&g_postLogs) <= 6000) L("[post] %u%s%s", id, g_akName[h] ? " " : "", g_akName[h] ? g_akName[h] : "");
             return;
         }
@@ -671,6 +754,7 @@ static void name_hit(const char *s, int n)
     int seen = ak_find(h);
     if (seen >= 0 && !g_akName[seen]) {
         char *d = malloc(n + 1); memcpy(d, s, n); d[n] = 0; g_akName[seen] = d;
+        if ((n > 5 && !_stricmp(d + n - 5, "_CINE")) || strstr(d, "CineDX")) g_akCine[seen] = 1;
         L("[name] %u = %s (posted %ld times so far)", h, d, g_akCnt[seen]);
     }
     if (seen < 0 && !cat_prefix(s, n)) return;
