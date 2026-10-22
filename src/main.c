@@ -19,7 +19,7 @@
 #include "MinHook.h"
 #include "winmm_names.h"
 
-#define LANTERN_VERSION "0.1.1-diag"
+#define LANTERN_VERSION "0.1.2-p1"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -212,6 +212,173 @@ static void process_report(BYTE *b, DWORD n, const char *via)
     }
 }
 
+
+/* ---------------- GameInput rumble ----------------
+ * 0.1.1 showed the game's rumble is neither in its HID reports nor an audio
+ * stream. UE 5.6 drives pads through GameInput, whose service writes the
+ * rumble from another process. Catch IGameInputDevice::SetRumbleState here.
+ * Vtable indexes from the public GameInput.h (NuGet Microsoft.GameInput 4.0.302). */
+typedef struct { float lowFrequency, highFrequency, leftTrigger, rightTrigger; } GIRumble;
+typedef void (STDMETHODCALLTYPE *SetRumbleFn)(void *, const GIRumble *);
+typedef HRESULT (STDMETHODCALLTYPE *SendRawFn)(void *, void *);
+
+typedef struct { const char *name; GUID gi; int legacyQI; int idxCurReading, idxGetDevice, idxRumble, idxSendRaw; int kindGamepadArg3; } GIVer;
+/* v0 legacy object from GameInputCreate; v1/v2 via QueryInterface on it; v3/v4 via GameInputInitialize */
+static GIVer g_giv[5] = {
+    { "v0", {0x11BE2A7E,0x4254,0x445A,{0x9C,0x09,0xFF,0xC4,0x0F,0x00,0x69,0x18}}, 0, 4, 6, 10, 17, 1 },
+    { "v1", {0x40FFB7E4,0x6150,0x407A,{0xB4,0x39,0x13,0x2B,0xAD,0xC0,0x8D,0x2D}}, 1, 4, 5, 8, -1, 1 },
+    { "v2", {0xBBAA66D2,0x837A,0x40F7,{0xA3,0x03,0x91,0x7D,0x50,0x09,0x55,0xF4}}, 1, 4, 5, 9, -1, 1 },
+    { "v3", {0x20EFC1C7,0x5D9A,0x43BA,{0xB2,0x6F,0xB8,0x07,0xFA,0x48,0x60,0x9C}}, 0, 4, 5, 9, 17, 1 },
+    { "v4", {0xF2DAAE4C,0x4D21,0x4250,{0x89,0x53,0x4F,0x79,0x1E,0x62,0x79,0xAB}}, 0, 4, 5, 47, 57, 1 },
+};
+static volatile LONG s_giRumble, s_giRumbleNZ, s_giRaw;
+static volatile LONG g_giHooked[5];
+static HRESULT (WINAPI *pGICreate)(void **);
+static HRESULT (WINAPI *pGIInit)(REFIID, void **);
+static HRESULT (WINAPI *oGICreate)(void **);
+static HRESULT (WINAPI *oGIInit)(REFIID, void **);
+static volatile LONG g_giSeen;
+
+static void gi_rumble(int v, const GIRumble *p, SetRumbleFn orig, void *self)
+{
+    LONG n = InterlockedIncrement(&s_giRumble);
+    float lo = p ? p->lowFrequency : 0.f, hi = p ? p->highFrequency : 0.f;
+    if (lo > 1) lo = 1; if (hi > 1) hi = 1; if (lo < 0) lo = 0; if (hi < 0) hi = 0;
+    g_low = lo; g_high = hi;
+    if (lo > 0 || hi > 0) { InterlockedIncrement(&s_giRumbleNZ); max_store(&s_maxLow, (LONG)(lo * 255)); max_store(&s_maxHigh, (LONG)(hi * 255)); }
+    if (n <= 40 || (n % 500) == 0)
+        L("[gi] %s SetRumbleState #%ld low=%.3f high=%.3f lt=%.3f rt=%.3f", g_giv[v].name, n, lo, hi, p ? p->leftTrigger : 0.f, p ? p->rightTrigger : 0.f);
+    if (C.enabled && g_hapticsLive && !C.keepNative) {
+        GIRumble z = {0};
+        if (p) { z.leftTrigger = p->leftTrigger; z.rightTrigger = p->rightTrigger; }
+        InterlockedIncrement(&s_stripped);
+        orig(self, &z);
+    } else orig(self, p);
+}
+
+#define GI_DETOURS(i) \
+    static SetRumbleFn oRumble##i; static SendRawFn oRaw##i; \
+    static void STDMETHODCALLTYPE hRumble##i(void *self, const GIRumble *p) { gi_rumble(i, p, oRumble##i, self); } \
+    static HRESULT STDMETHODCALLTYPE hRaw##i(void *self, void *rep) { \
+        if (InterlockedIncrement(&s_giRaw) <= 20) L("[gi] %s SendRawDeviceOutput report %p", g_giv[i].name, rep); \
+        return oRaw##i(self, rep); }
+GI_DETOURS(0) GI_DETOURS(1) GI_DETOURS(2) GI_DETOURS(3) GI_DETOURS(4)
+static void *g_hRumble[5] = { hRumble0, hRumble1, hRumble2, hRumble3, hRumble4 };
+static SetRumbleFn *g_oRumble[5] = { &oRumble0, &oRumble1, &oRumble2, &oRumble3, &oRumble4 };
+static void *g_hRaw[5] = { hRaw0, hRaw1, hRaw2, hRaw3, hRaw4 };
+static SendRawFn *g_oRaw[5] = { &oRaw0, &oRaw1, &oRaw2, &oRaw3, &oRaw4 };
+static void *g_rumbleTargets[5];
+
+static HRESULT WINAPI hGICreate(void **out)
+{
+    HRESULT hr = oGICreate(out);
+    if (InterlockedIncrement(&g_giSeen) <= 5) L("[gi] game called GameInputCreate -> 0x%08lX", hr);
+    return hr;
+}
+static HRESULT WINAPI hGIInit(REFIID riid, void **out)
+{
+    HRESULT hr = oGIInit(riid, out);
+    const char *nm = "unknown IID";
+    for (int i = 0; i < 5; i++) if (IsEqualGUID(riid, &g_giv[i].gi)) nm = g_giv[i].name;
+    if (InterlockedIncrement(&g_giSeen) <= 5)
+        L("[gi] game called GameInputInitialize(%s {%08lX-...}) -> 0x%08lX", nm, riid ? riid->Data1 : 0, hr);
+    return hr;
+}
+
+static void gi_hook_module(HMODULE m, const wchar_t *nm)
+{
+    static volatile LONG done;
+    if (InterlockedExchange(&done, 1)) return;
+    wchar_t path[MAX_PATH]; GetModuleFileNameW(m, path, MAX_PATH);
+    L("[gi] GameInput module loaded: %ls (%ls)", path, nm);
+    pGICreate = (void *)GetProcAddress(m, "GameInputCreate");
+    pGIInit = (void *)GetProcAddress(m, "GameInputInitialize");
+    if (pGICreate && MH_CreateHook(pGICreate, hGICreate, (void **)&oGICreate) == MH_OK) MH_EnableHook(pGICreate);
+    if (pGIInit && MH_CreateHook(pGIInit, hGIInit, (void **)&oGIInit) == MH_OK) MH_EnableHook(pGIInit);
+    L("[gi] exports: GameInputCreate=%p GameInputInitialize=%p", pGICreate, pGIInit);
+}
+
+/* Build our own GameInput object per version, take a gamepad reading, get its device and hook its vtable. */
+static void gi_probe(void)
+{
+    for (int v = 0; v < 5; v++) {
+        if (g_giHooked[v]) continue;
+        GIVer *V = &g_giv[v];
+        void *gi = NULL; HRESULT hr;
+        if (v <= 2) {
+            if (!pGICreate) continue;
+            void *legacy = NULL;
+            hr = (oGICreate ? oGICreate : pGICreate)(&legacy);
+            if (FAILED(hr) || !legacy) continue;
+            if (v == 0) gi = legacy;
+            else { IUnknown *u = legacy; if (FAILED(u->lpVtbl->QueryInterface(u, &V->gi, &gi))) gi = NULL; u->lpVtbl->Release(u); }
+        } else {
+            if (!pGIInit) continue;
+            hr = (oGIInit ? oGIInit : pGIInit)(&V->gi, &gi);
+            if (FAILED(hr)) gi = NULL;
+        }
+        if (!gi) { g_giHooked[v] = -1; continue; }
+        void **vt = *(void ***)gi;
+        typedef HRESULT (STDMETHODCALLTYPE *CurFn)(void *, int, void *, void **);
+        void *rd = NULL;
+        hr = ((CurFn)vt[V->idxCurReading])(gi, 0x00040000 /* GameInputKindGamepad */, NULL, &rd);
+        if (SUCCEEDED(hr) && rd) {
+            void **rvt = *(void ***)rd; void *dev = NULL;
+            ((void (STDMETHODCALLTYPE *)(void *, void **))rvt[V->idxGetDevice])(rd, &dev);
+            if (dev) {
+                void **dvt = *(void ***)dev;
+                void *tR = dvt[V->idxRumble];
+                int shared = -1;
+                for (int k = 0; k < 5; k++) if (g_rumbleTargets[k] == tR) shared = k;
+                if (shared >= 0) L("[gi] %s SetRumbleState %p shared with %s, already hooked", V->name, tR, g_giv[shared].name);
+                else {
+                    MH_STATUS st = MH_CreateHook(tR, g_hRumble[v], (void **)g_oRumble[v]);
+                    if (st == MH_OK) st = MH_EnableHook(tR);
+                    if (st == MH_OK) g_rumbleTargets[v] = tR;
+                    L("[gi] %s hook SetRumbleState @%p: %s", V->name, tR, MH_StatusToString(st));
+                }
+                if (V->idxSendRaw > 0) {
+                    void *tS = dvt[V->idxSendRaw];
+                    MH_STATUS st = MH_CreateHook(tS, g_hRaw[v], (void **)g_oRaw[v]);
+                    if (st == MH_OK) st = MH_EnableHook(tS);
+                    if (st != MH_ERROR_ALREADY_CREATED) L("[gi] %s hook SendRawDeviceOutput @%p: %s", V->name, tS, MH_StatusToString(st));
+                }
+                g_giHooked[v] = 1;
+                ((IUnknown *)dev)->lpVtbl->Release((IUnknown *)dev);
+            }
+            ((IUnknown *)rd)->lpVtbl->Release((IUnknown *)rd);
+        }
+        ((IUnknown *)gi)->lpVtbl->Release((IUnknown *)gi);
+    }
+}
+
+static HMODULE (WINAPI *oLoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
+static HMODULE WINAPI hLoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl)
+{
+    HMODULE m = oLoadLibraryExW(n, f, fl);
+    if (m && n && !t_inHook) {
+        const wchar_t *b = wcsrchr(n, L'\\'); b = b ? b + 1 : n;
+        if (!_wcsnicmp(b, L"GameInput", 9)) { t_inHook++; gi_hook_module(m, b); t_inHook--; }
+    }
+    return m;
+}
+
+static DWORD WINAPI gi_thread(void *arg)
+{
+    (void)arg;
+    for (int t = 0;; t++) {
+        HMODULE m = GetModuleHandleW(L"GameInputRedist.dll");
+        if (!m) m = GetModuleHandleW(L"GameInput.dll");
+        if (m) gi_hook_module(m, L"(found loaded)");
+        if (pGICreate || pGIInit) {
+            int pending = 0;
+            for (int v = 0; v < 5; v++) if (g_giHooked[v] == 0) pending = 1;
+            if (pending) gi_probe();
+        }
+        Sleep(t < 60 ? 1000 : 3000);
+    }
+}
+
 /* ---------------- hooks ---------------- */
 static HANDLE (WINAPI *oCreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static HANDLE (WINAPI *oCreateFileA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
@@ -298,6 +465,7 @@ static void install_hooks(void)
     hook(kb, "WriteFile", hWriteFile, (void **)&oWriteFile);
     hook(kb, "DeviceIoControl", hDeviceIoControl, (void **)&oDeviceIoControl);
     hook(kb, "CloseHandle", hCloseHandle, (void **)&oCloseHandle);
+    hook(kb, "LoadLibraryExW", hLoadLibraryExW, (void **)&oLoadLibraryExW);
 }
 
 
@@ -624,9 +792,9 @@ static DWORD WINAPI stats_thread(void *arg)
     LONG lw = -1, li = -1;
     for (int t = 0;; t++) {
         Sleep(5000);
-        if (s_writes != lw || s_ioctl != li || t % 12 == 0) {
-            L("[stats] writes=%ld ioctl=%ld rumble=%ld stripped=%ld bt=%ld maxLow=%ld maxHigh=%ld haptics=%s",
-              s_writes, s_ioctl, s_rumble, s_stripped, s_bt, s_maxLow, s_maxHigh, g_hapticsLive ? "on" : "off");
+        if (s_writes != lw || s_ioctl != li || s_giRumble || t % 12 == 0) {
+            L("[stats] writes=%ld ioctl=%ld hidRumble=%ld giRumble=%ld giNonZero=%ld giRaw=%ld stripped=%ld bt=%ld maxLow=%ld maxHigh=%ld haptics=%s",
+              s_writes, s_ioctl, s_rumble, s_giRumble, s_giRumbleNZ, s_giRaw, s_stripped, s_bt, s_maxLow, s_maxHigh, g_hapticsLive ? "on" : "off");
             lw = s_writes; li = s_ioctl;
         }
         tap_stats();
@@ -654,5 +822,6 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)
     install_hooks();
     CloseHandle(CreateThread(NULL, 0, audio_thread, NULL, 0, NULL));
     CloseHandle(CreateThread(NULL, 0, stats_thread, NULL, 0, NULL));
+    CloseHandle(CreateThread(NULL, 0, gi_thread, NULL, 0, NULL));
     return TRUE;
 }
