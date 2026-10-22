@@ -1,5 +1,5 @@
 /*
- * lantern: winmm.dll proxy.
+ * Lambent: Gears of War: E-Day DualSense haptics. winmm.dll proxy (formerly lantern).
  * Phase 1: catch the game's DualSense rumble in its HID output reports,
  * strip the motor values (triggers, lights untouched) and play real
  * waveforms on the voice coils through the controller's USB audio endpoint.
@@ -20,7 +20,7 @@
 #include "winmm_names.h"
 #include "events_default.h"
 
-#define LANTERN_VERSION "0.1.8"
+#define LANTERN_VERSION "0.2.0"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -68,7 +68,7 @@ static float ini_f(const wchar_t *sec, const wchar_t *key, float def)
 }
 
 static const char *DEFAULT_INI =
-    "; lantern settings. Delete this file to get the defaults back.\r\n"
+    "; Lambent settings. Delete this file to get the defaults back.\r\n"
     "[General]\r\n"
     "Enabled=1\r\n"
     "; master haptic strength 0..2\r\n"
@@ -100,11 +100,11 @@ static const char *DEFAULT_INI =
     "HookWwise=1\r\n"
     "; log each Wwise event as it plays (spammy ids stop after 20 lines)\r\n"
     "LogPosts=1\r\n"
-    "; look up event names in game memory at 1, 3 and 6 minutes, writes lantern_events.txt\r\n"
+    "; look up event names in game memory at 1, 3 and 6 minutes, writes lambent_catalog.txt\r\n"
     "NameScan=1\r\n"
-    "; sound event haptics live in lantern_events.ini next to this file\r\n";
+    "; the sound event list lives in lambent_events.ini next to this file\r\n";
 
-/* added to an older lantern.ini that has no [Sound] section yet */
+/* added to an older lambent.ini that has no [Sound] section yet */
 static const char *DEFAULT_SOUND_INI =
     "\r\n[Sound]\r\n"
     "; strength per kind of sound haptic (0 = off, 1 = default, up to 2)\r\n"
@@ -151,21 +151,34 @@ static const wchar_t *g_catNames[] = { L"Boots", L"Guns", L"Reload", L"Melee", L
 #define CAT_MENUS (NCAT - 1)
 #define PRESET_CINE 99
 static volatile ULONGLONG g_cineUntil;
+
+/* sustained effects: a start event begins a pulse train that runs until a stop event,
+   until the game's rumble goes quiet (stop=rumble), or until maxSec */
+#define MAXLOOP 128
+#define MAXSTOP 4
+typedef struct { DWORD start; int preset; float gain; int side; int cat; float periodMs, maxSec, dubMs; int untilRumble; DWORD stop[MAXSTOP]; int nstop; int group; } LoopDef;
+static LoopDef g_lp[MAXLOOP];
+static int g_lpN;
+/* one running state per group (lines with the same name share it) */
+static volatile LONG g_lpOn[MAXLOOP];          /* def index + 1 currently driving the group, 0 = off */
+static volatile ULONGLONG g_lpT0[MAXLOOP];
+static wchar_t g_lpGroupName[MAXLOOP][24];
+static int g_lpGroups;
 static int g_evN;
 static volatile LONG g_evQ[64], g_evW, g_evFired;
 
 static void load_events(void)
 {
     static wchar_t buf[262144];
-    wchar_t evp[MAX_PATH]; wcscpy(evp, g_dir); wcscat(evp, L"lantern_events.ini");
-    {   /* replace an events file from an older version (keeps it as lantern_events.old.ini) */
+    wchar_t evp[MAX_PATH]; wcscpy(evp, g_dir); wcscat(evp, L"lambent_events.ini");
+    {   /* replace an events file from an older version (keeps it as lambent_events.old.ini) */
         HANDLE h = CreateFileW(evp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
         if (h != INVALID_HANDLE_VALUE) {
             char hd[512] = ""; DWORD r = 0; ReadFile(h, hd, sizeof hd - 1, &r, NULL); hd[r] = 0; CloseHandle(h);
-            if (!strstr(hd, "format 2")) {
-                wchar_t old[MAX_PATH]; wcscpy(old, g_dir); wcscat(old, L"lantern_events.old.ini");
+            if (!strstr(hd, "format 3")) {
+                wchar_t old[MAX_PATH]; wcscpy(old, g_dir); wcscat(old, L"lambent_events.old.ini");
                 MoveFileExW(evp, old, MOVEFILE_REPLACE_EXISTING);
-                L("[ev] old lantern_events.ini kept as lantern_events.old.ini, writing the new defaults");
+                L("[ev] old lambent_events.ini kept as lambent_events.old.ini, writing the new defaults");
             }
         }
     }
@@ -200,12 +213,59 @@ static void load_events(void)
         if (pi != PRESET_CINE && gain <= 0) continue;
         g_ev[g_evN].id = id; g_ev[g_evN].preset = pi; g_ev[g_evN].gain = gain; g_ev[g_evN].side = side; g_ev[g_evN].cat = cat; g_evN++;
     }
-    L("[ev] %d allowlisted sound events", g_evN);
+    n = GetPrivateProfileSectionW(L"Loops", buf, 262144, evp);
+    for (wchar_t *e = buf; n && *e && g_lpN < MAXLOOP; e += wcslen(e) + 1) {
+        /* startId=group,preset,gain,side,category,periodMs,maxSec,dubMs,stop  (stop = rumble or ids joined by |) */
+        if (*e == L';') continue;
+        DWORD id = (DWORD)wcstoul(e, NULL, 10);
+        wchar_t *v = wcschr(e, L'='); if (!id || !v) continue;
+        wchar_t f[9][48]; int nf = 0; v++;
+        while (nf < 9) {
+            int q = 0; while (*v && *v != L',' && *v != L';' && q < 47) f[nf][q++] = *v++;
+            while (q && f[nf][q - 1] == L' ') q--;
+            f[nf][q] = 0; nf++;
+            if (*v != L',') break; v++;
+        }
+        if (nf < 9) { L("[loop] bad line for %u", id); continue; }
+        LoopDef *d = &g_lp[g_lpN]; memset(d, 0, sizeof *d);
+        d->start = id; d->preset = -1;
+        for (int i = 0; i < NPRESET; i++) { wchar_t w[16]; swprintf(w, 16, L"%hs", g_presets[i].name); if (!_wcsicmp(w, f[1])) d->preset = i; }
+        if (d->preset < 0) { L("[loop] unknown preset for %u", id); continue; }
+        d->gain = (float)_wtof(f[2]);
+        d->side = (f[3][0] == L'L') ? 1 : (f[3][0] == L'R') ? 2 : (f[3][0] == L'A') ? 3 : 0;
+        d->cat = -1; for (int c = 0; c < NCAT; c++) if (!_wcsicmp(f[4], g_catNames[c])) d->cat = c;
+        if (d->cat >= 0) { float cg = ini_f(L"Sound", g_catNames[d->cat], d->cat == 0 ? 0.6f : 1.0f); if (cg < 0) cg = 0; if (cg > 2) cg = 2; d->gain *= cg; }
+        d->periodMs = (float)_wtof(f[5]); d->maxSec = (float)_wtof(f[6]); d->dubMs = (float)_wtof(f[7]);
+        if (d->periodMs < 20) d->periodMs = 20; if (d->maxSec <= 0) d->maxSec = 5;
+        wchar_t *sp = f[8];
+        while (*sp) {
+            while (*sp == L'|' || *sp == L' ') sp++;
+            if (!*sp) break;
+            if (!_wcsnicmp(sp, L"rumble", 6)) { d->untilRumble = 1; sp += 6; continue; }
+            wchar_t *en; DWORD sid = (DWORD)wcstoul(sp, &en, 10);
+            if (en == sp) break;
+            if (d->nstop < MAXSTOP) d->stop[d->nstop++] = sid;
+            sp = en;
+        }
+        int g = -1; for (int i = 0; i < g_lpGroups; i++) if (!_wcsicmp(g_lpGroupName[i], f[0])) g = i;
+        if (g < 0) { g = g_lpGroups++; wcsncpy(g_lpGroupName[g], f[0], 23); }
+        d->group = g;
+        if (d->gain <= 0) continue;
+        g_lpN++;
+    }
+    L("[ev] %d allowlisted sound events, %d loop starts in %d groups", g_evN, g_lpN, g_lpGroups);
 }
 
 /* called on the game's thread from the PostEvent hook: queue only, never block */
 static void ev_post(DWORD id)
 {
+    for (int i = 0; i < g_lpN; i++) {
+        LoopDef *d = &g_lp[i];
+        if (d->start == id) {
+            if (!(C.cineMute && GetTickCount64() < g_cineUntil)) { g_lpT0[d->group] = GetTickCount64(); InterlockedExchange(&g_lpOn[d->group], i + 1); }
+        }
+        for (int k = 0; k < d->nstop; k++) if (d->stop[k] == id && g_lpOn[d->group] == i + 1) InterlockedExchange(&g_lpOn[d->group], 0);
+    }
     for (int i = 0; i < g_evN; i++) if (g_ev[i].id == id) {
         if (g_ev[i].preset == PRESET_CINE) { if (C.cineMute) g_cineUntil = GetTickCount64() + (ULONGLONG)(C.cineHold * 1000); return; }
         if (C.cineMute && g_ev[i].cat != CAT_MENUS && GetTickCount64() < g_cineUntil) return;
@@ -673,7 +733,7 @@ void ak_log(int k, void *a, void *b)
     }
     if (!id) return;
     InterlockedIncrement(&g_akTotal);
-    if (g_evN) ev_post(id);
+    if (g_evN || g_lpN) ev_post(id);
     for (int j = 0, h = id & (AKH - 1); j < AKH; j++, h = (h + 1) & (AKH - 1)) {
         LONG cur = g_akId[h];
         if (cur == (LONG)id) {
@@ -799,10 +859,10 @@ static void name_scan(int pass)
     }
     int named = 0; for (int h = 0; h < AKH; h++) if (g_akId[h] && g_akName[h]) named++;
     L("[name] scan %d: %.0f MB in %lu ms, %d of %ld posted ids named, catalog %d (+%d)", pass, scanned / 1048576.0, GetTickCount() - t0, named, g_akUnique, g_catN, g_catN - before);
-    wchar_t p[MAX_PATH]; wcscpy(p, g_dir); wcscat(p, L"lantern_events.txt");
+    wchar_t p[MAX_PATH]; wcscpy(p, g_dir); wcscat(p, L"lambent_catalog.txt");
     FILE *f = _wfopen(p, L"w");
     if (!f) return;
-    fprintf(f, "# lantern %s event catalog, scan %d. id, times posted this session, name\n", LANTERN_VERSION, pass);
+    fprintf(f, "# Lambent %s event catalog, scan %d. id, times posted this session, name\n", LANTERN_VERSION, pass);
     for (int k = 0; k < CATN; k++) if (g_catId[k]) { int s2 = ak_find(g_catId[k]); fprintf(f, "%u\t%ld\t%s\n", g_catId[k], s2 >= 0 ? g_akCnt[s2] : 0L, g_catName[k]); }
     for (int h = 0; h < AKH; h++) if (g_akId[h] && !g_akName[h]) fprintf(f, "%u\t%ld\t?\n", (DWORD)g_akId[h], g_akCnt[h]);
     fclose(f);
@@ -1149,7 +1209,45 @@ static IMMDevice *find_ds_endpoint(IMMDeviceEnumerator *en, wchar_t *nameOut)
 }
 
 typedef struct { double ph; float amp, decay, hz; int left, side; } Voice;
-typedef struct { double phL, phH, phT; float low, high, tr, lastSum; int chime; LONG evR; Voice v[8]; } Synth;
+typedef struct { double phL, phH, phT; float low, high, tr, lastSum; int chime; LONG evR; Voice v[8];
+    ULONGLONG lpNext[MAXLOOP], lpDub[MAXLOOP], lpQuiet[MAXLOOP]; int lpAlt; } Synth;
+
+static void voice_start(Synth *S, int preset, float amp, int side, int sr)
+{
+    int slot = 0;
+    for (int k = 1; k < 8; k++) if (S->v[k].left < S->v[slot].left) slot = k;
+    const Preset *pr = &g_presets[preset];
+    Voice *vo = &S->v[slot];
+    vo->ph = 0; vo->hz = pr->hz; vo->amp = amp;
+    vo->decay = expf(-1.f / (sr * pr->decayMs / 1000.f)); vo->left = (int)(sr * pr->lenMs / 1000.f); vo->side = side;
+    if (vo->side == 3) { S->lpAlt ^= 1; vo->side = S->lpAlt ? 1 : 2; }
+}
+
+static void loops_run(Synth *S, int sr)
+{
+    if (!g_lpN) return;
+    ULONGLONG now = GetTickCount64();
+    float rum = g_low + g_high;
+    for (int g = 0; g < g_lpGroups; g++) {
+        LONG on = g_lpOn[g];
+        if (!on) { S->lpNext[g] = 0; continue; }
+        LoopDef *d = &g_lp[on - 1];
+        ULONGLONG t0 = g_lpT0[g];
+        if (now - t0 > (ULONGLONG)(d->maxSec * 1000)) { InterlockedCompareExchange(&g_lpOn[g], 0, on); continue; }
+        if (C.cineMute && now < g_cineUntil && d->cat != CAT_MENUS) { InterlockedCompareExchange(&g_lpOn[g], 0, on); continue; }
+        if (d->untilRumble && now - t0 > 150) {
+            if (rum < 0.02f) { if (!S->lpQuiet[g]) S->lpQuiet[g] = now; else if (now - S->lpQuiet[g] > 200) { InterlockedCompareExchange(&g_lpOn[g], 0, on); S->lpQuiet[g] = 0; continue; } }
+            else S->lpQuiet[g] = 0;
+        }
+        if (!S->lpNext[g] || S->lpNext[g] < t0) S->lpNext[g] = t0;
+        if (now >= S->lpNext[g]) {
+            voice_start(S, d->preset, d->gain * C.evGain, d->side, sr);
+            if (d->dubMs > 0) S->lpDub[g] = now + (ULONGLONG)d->dubMs;
+            S->lpNext[g] = now + (ULONGLONG)d->periodMs;
+        }
+        if (S->lpDub[g] && now >= S->lpDub[g]) { voice_start(S, d->preset, d->gain * C.evGain * 0.6f, d->side, sr); S->lpDub[g] = 0; }
+    }
+}
 
 static void synth_fill(Synth *S, BYTE *out, UINT frames, int ch, int isFloat, int bits, int iL, int iR, int sr)
 {
@@ -1163,14 +1261,10 @@ static void synth_fill(Synth *S, BYTE *out, UINT frames, int ch, int isFloat, in
         LONG e = InterlockedExchange(&g_evQ[S->evR & 63], 0);
         if (!e) break;
         S->evR++;
-        int ei = e - 1, slot = 0;
-        for (int k = 1; k < 8; k++) if (S->v[k].left < S->v[slot].left) slot = k;
-        const Preset *pr = &g_presets[g_ev[ei].preset];
-        Voice *vo = &S->v[slot];
-        vo->ph = 0; vo->hz = pr->hz; vo->amp = g_ev[ei].gain * C.evGain;
-        vo->decay = expf(-1.f / (sr * pr->decayMs / 1000.f)); vo->left = (int)(sr * pr->lenMs / 1000.f); vo->side = g_ev[ei].side;
-        if (vo->side == 3) { static int alt; alt ^= 1; vo->side = alt ? 1 : 2; }
+        int ei = e - 1;
+        voice_start(S, g_ev[ei].preset, g_ev[ei].gain * C.evGain, g_ev[ei].side, sr);
     }
+    loops_run(S, sr);
     if (sum - S->lastSum > C.trThresh) { S->tr += (sum - S->lastSum) * C.trGain; if (S->tr > 1) S->tr = 1; }
     S->lastSum = sum;
     float atk = 1.f - expf(-1.f / (sr * 0.004f));
@@ -1328,12 +1422,16 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)
     load_real_winmm();
     GetModuleFileNameW(inst, g_dir, MAX_PATH);
     wchar_t *sl = wcsrchr(g_dir, L'\\'); if (sl) sl[1] = 0;
-    wchar_t logp[MAX_PATH]; wcscpy(logp, g_dir); wcscat(logp, L"lantern.log");
-    wcscpy(g_ini, g_dir); wcscat(g_ini, L"lantern.ini");
+    wchar_t logp[MAX_PATH]; wcscpy(logp, g_dir); wcscat(logp, L"lambent.log");
+    wcscpy(g_ini, g_dir); wcscat(g_ini, L"lambent.ini");
+    {   /* carry settings over from the lantern builds */
+        wchar_t old[MAX_PATH]; wcscpy(old, g_dir); wcscat(old, L"lantern.ini");
+        if (GetFileAttributesW(g_ini) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES) MoveFileW(old, g_ini);
+    }
     InitializeCriticalSection(&g_logCs);
     g_log = _wfopen(logp, L"w");
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(NULL, exe, MAX_PATH);
-    L("lantern %s starting in %ls", LANTERN_VERSION, exe);
+    L("Lambent %s starting in %ls", LANTERN_VERSION, exe);
     L("real winmm: %p", g_realWinmm);
     load_config();
     install_hooks();
