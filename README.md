@@ -4,6 +4,12 @@ Real DualSense voice-coil haptics for Gears of War: E-Day on Steam, as a small `
 
 > [!WARNING]
 > **Story mode only, with anti-cheat turned off.** This mod hooks the game's sound engine and controller output, so it only works when the game runs **without Easy Anti-Cheat**. Do not use it in multiplayer or any online mode. Using a modded game online can get your account banned. Use it in the campaign only, at your own risk.
+>
+> **To play offline without anti-cheat, use [Gears of War E-Day EAC Offline Bypass](https://www.nexusmods.com/gearsofwareday/mods/4) on Nexus Mods, or set the Windows environment variable `EOS_USE_ANTICHEATCLIENTNULL` to `1` and restart your PC.**
+
+## Why this mod
+
+The PC version already supports most of the DualSense: adaptive triggers, gyro, lightbar and PlayStation button prompts. Sadly the biggest one, HD haptics, is not supported, and the game falls back to the old two-motor rumble. This mod adds it.
 
 * **HD haptics instead of rumble:** on PC the game only drives the DualSense like an old two-motor pad, which feels weak and buzzy. The mod catches that rumble and plays it on the controller's left and right haptic actuators instead: a deep thump for the heavy motor, a sharper buzz for the light one, a curve that brings out the quiet rumble the game sends most of the time, and an extra click on sharp hits.
 * **Feel the sound effects:** about 280 of the game's own sounds, taken straight from its Wwise sound engine, and only the ones made by you (never squad mates, enemies or music): boots (alternating left and right), landings, mantles, rolls, cover slams and slides, every shot, every part of a reload, active reload, equip, grenades, kicks, executions, getting hurt and going down, ammo and collectible pickups, doors, chests, E-holes, screen shake, the hit marker and the menus.
