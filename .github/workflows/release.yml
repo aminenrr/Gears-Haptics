@@ -1,0 +1,35 @@
+name: release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ziglang
+      - run: sh build.sh
+      - name: package
+        run: |
+          V=$(grep -o 'LANTERN_VERSION "[^"]*"' src/main.c | cut -d'"' -f2)
+          D=pkg/FairlightConcept/Binaries/Win64
+          mkdir -p $D
+          cp out/winmm.dll out/GearsHaptics.ini out/GearsHaptics_events.ini $D/
+          cp README.md pkg/GearsHaptics-README.md
+          (cd pkg && zip -r ../GearsHaptics-$V.zip .)
+          echo "ZIP=GearsHaptics-$V.zip" >> $GITHUB_ENV
+      - name: upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "$ZIP" --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GearsHaptics
+          path: GearsHaptics-*.zip
