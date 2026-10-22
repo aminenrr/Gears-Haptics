@@ -19,7 +19,7 @@
 #include "MinHook.h"
 #include "winmm_names.h"
 
-#define LANTERN_VERSION "0.1.2-p1"
+#define LANTERN_VERSION "0.1.2-p2"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -287,15 +287,55 @@ static HRESULT WINAPI hGIInit(REFIID riid, void **out)
 
 static void gi_hook_module(HMODULE m, const wchar_t *nm)
 {
-    static volatile LONG done;
+    /* 0.1.2-p1 bug: a datafile/resource mapping of GameInput.dll latched this and hid the real load.
+       Only latch once the exports resolve. */
+    static volatile LONG done, logged;
+    if (done) return;
+    wchar_t path[MAX_PATH] = L""; GetModuleFileNameW(m, path, MAX_PATH);
+    void *c = (void *)GetProcAddress(m, "GameInputCreate");
+    void *i = (void *)GetProcAddress(m, "GameInputInitialize");
+    if (InterlockedIncrement(&logged) <= 10)
+        L("[gi] GameInput module seen: %ls (%ls) handle=%p create=%p init=%p", path, nm, m, c, i);
+    if (!c && !i) return;
     if (InterlockedExchange(&done, 1)) return;
-    wchar_t path[MAX_PATH]; GetModuleFileNameW(m, path, MAX_PATH);
-    L("[gi] GameInput module loaded: %ls (%ls)", path, nm);
-    pGICreate = (void *)GetProcAddress(m, "GameInputCreate");
-    pGIInit = (void *)GetProcAddress(m, "GameInputInitialize");
+    pGICreate = c; pGIInit = i;
     if (pGICreate && MH_CreateHook(pGICreate, hGICreate, (void **)&oGICreate) == MH_OK) MH_EnableHook(pGICreate);
     if (pGIInit && MH_CreateHook(pGIInit, hGIInit, (void **)&oGIInit) == MH_OK) MH_EnableHook(pGIInit);
-    L("[gi] exports: GameInputCreate=%p GameInputInitialize=%p", pGICreate, pGIInit);
+    L("[gi] hooked exports: GameInputCreate=%p GameInputInitialize=%p", pGICreate, pGIInit);
+}
+
+/* ---------------- XInput rumble (insurance) ----------------
+ * If the game or a layer above it (Steam Input) drives rumble through XInput, catch it here. */
+typedef struct { WORD l, r; } XVib;
+typedef DWORD (WINAPI *XSetFn)(DWORD, XVib *);
+static XSetFn oXSet[4]; static volatile LONG s_xi, s_xiNZ; static volatile LONG g_xiDone[4];
+static DWORD xi_set(int k, DWORD u, XVib *v)
+{
+    LONG n = InterlockedIncrement(&s_xi);
+    float lo = v ? v->l / 65535.f : 0.f, hi = v ? v->r / 65535.f : 0.f;
+    if (lo > 0 || hi > 0) { InterlockedIncrement(&s_xiNZ); g_low = lo; g_high = hi; max_store(&s_maxLow, (LONG)(lo * 255)); max_store(&s_maxHigh, (LONG)(hi * 255)); }
+    else if (n > 1) { g_low = 0; g_high = 0; }
+    if (n <= 40 || (n % 500) == 0) L("[xi] XInputSetState #%ld user=%lu low=%.3f high=%.3f", n, u, lo, hi);
+    if (C.enabled && g_hapticsLive && !C.keepNative && v) { XVib z = {0, 0}; return oXSet[k](u, &z); }
+    return oXSet[k](u, v);
+}
+static DWORD WINAPI hX0(DWORD u, XVib *v) { return xi_set(0, u, v); }
+static DWORD WINAPI hX1(DWORD u, XVib *v) { return xi_set(1, u, v); }
+static DWORD WINAPI hX2(DWORD u, XVib *v) { return xi_set(2, u, v); }
+static DWORD WINAPI hX3(DWORD u, XVib *v) { return xi_set(3, u, v); }
+static void xi_scan(void)
+{
+    static const wchar_t *mods[4] = { L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll", L"xinputuap.dll" };
+    static void *hk[4] = { hX0, hX1, hX2, hX3 };
+    for (int k = 0; k < 4; k++) {
+        if (g_xiDone[k]) continue;
+        HMODULE m = GetModuleHandleW(mods[k]); if (!m) continue;
+        void *f = (void *)GetProcAddress(m, "XInputSetState"); if (!f) continue;
+        g_xiDone[k] = 1;
+        MH_STATUS st = MH_CreateHook(f, hk[k], (void **)&oXSet[k]);
+        if (st == MH_OK) st = MH_EnableHook(f);
+        L("[xi] %ls loaded, hook XInputSetState @%p: %s", mods[k], f, MH_StatusToString(st));
+    }
 }
 
 /* Build our own GameInput object per version, take a gamepad reading, get its device and hook its vtable. */
@@ -356,7 +396,7 @@ static HMODULE (WINAPI *oLoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
 static HMODULE WINAPI hLoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl)
 {
     HMODULE m = oLoadLibraryExW(n, f, fl);
-    if (m && n && !t_inHook) {
+    if (m && n && !t_inHook && !(fl & 0x62) /* skip datafile / image-resource mappings */) {
         const wchar_t *b = wcsrchr(n, L'\\'); b = b ? b + 1 : n;
         if (!_wcsnicmp(b, L"GameInput", 9)) { t_inHook++; gi_hook_module(m, b); t_inHook--; }
     }
@@ -370,6 +410,7 @@ static DWORD WINAPI gi_thread(void *arg)
         HMODULE m = GetModuleHandleW(L"GameInputRedist.dll");
         if (!m) m = GetModuleHandleW(L"GameInput.dll");
         if (m) gi_hook_module(m, L"(found loaded)");
+        xi_scan();
         if (pGICreate || pGIInit) {
             int pending = 0;
             for (int v = 0; v < 5; v++) if (g_giHooked[v] == 0) pending = 1;
@@ -793,8 +834,8 @@ static DWORD WINAPI stats_thread(void *arg)
     for (int t = 0;; t++) {
         Sleep(5000);
         if (s_writes != lw || s_ioctl != li || s_giRumble || t % 12 == 0) {
-            L("[stats] writes=%ld ioctl=%ld hidRumble=%ld giRumble=%ld giNonZero=%ld giRaw=%ld stripped=%ld bt=%ld maxLow=%ld maxHigh=%ld haptics=%s",
-              s_writes, s_ioctl, s_rumble, s_giRumble, s_giRumbleNZ, s_giRaw, s_stripped, s_bt, s_maxLow, s_maxHigh, g_hapticsLive ? "on" : "off");
+            L("[stats] writes=%ld ioctl=%ld hidRumble=%ld giRumble=%ld giNonZero=%ld giRaw=%ld xi=%ld xiNonZero=%ld stripped=%ld bt=%ld maxLow=%ld maxHigh=%ld haptics=%s",
+              s_writes, s_ioctl, s_rumble, s_giRumble, s_giRumbleNZ, s_giRaw, s_xi, s_xiNZ, s_stripped, s_bt, s_maxLow, s_maxHigh, g_hapticsLive ? "on" : "off");
             lw = s_writes; li = s_ioctl;
         }
         tap_stats();
