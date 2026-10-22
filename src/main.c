@@ -19,7 +19,7 @@
 #include "MinHook.h"
 #include "winmm_names.h"
 
-#define LANTERN_VERSION "0.1.2-p2"
+#define LANTERN_VERSION "0.1.3-diag"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -52,7 +52,7 @@ static void L(const char *fmt, ...)
 }
 
 static struct {
-    int enabled, keepNative, logReports;
+    int enabled, keepNative, logReports, hookWwise;
     float strength, lowHz, highHz, lowGain, highGain, bleed, trGain, trThresh, chime;
 } C;
 
@@ -87,7 +87,10 @@ static const char *DEFAULT_INI =
     "SideBleed=0.35\r\n"
     "; extra click on sudden hits (0 = off)\r\n"
     "TransientGain=0.9\r\n"
-    "TransientThreshold=0.2\r\n";
+    "TransientThreshold=0.2\r\n"
+    "\r\n[Diag]\r\n"
+    "; log the game's Wwise sound events (log only). Set 0 if the game crashes about 15 s after launch.\r\n"
+    "HookWwise=1\r\n";
 
 static void load_config(void)
 {
@@ -99,6 +102,7 @@ static void load_config(void)
     C.strength   = ini_f(L"General", L"Strength", 1.0f);
     C.keepNative = (int)ini_f(L"General", L"KeepNativeRumble", 0);
     C.logReports = (int)ini_f(L"General", L"LogReports", 200);
+    C.hookWwise = (int)ini_f(L"Diag", L"HookWwise", 1);
     C.chime      = ini_f(L"General", L"Chime", 1);
     C.lowHz      = ini_f(L"Tuning", L"LowMotorHz", 75);
     C.highHz     = ini_f(L"Tuning", L"HighMotorHz", 185);
@@ -339,9 +343,11 @@ static void xi_scan(void)
 }
 
 /* Build our own GameInput object per version, take a gamepad reading, get its device and hook its vtable. */
+static void cen_table(int t, void **vt, const char *nm);
 static void gi_probe(void)
 {
     for (int v = 0; v < 5; v++) {
+        if (v != 0 && v != 3) g_giHooked[v] = 1; /* census only the versions the game uses */
         if (g_giHooked[v]) continue;
         GIVer *V = &g_giv[v];
         void *gi = NULL; HRESULT hr;
@@ -367,22 +373,8 @@ static void gi_probe(void)
             ((void (STDMETHODCALLTYPE *)(void *, void **))rvt[V->idxGetDevice])(rd, &dev);
             if (dev) {
                 void **dvt = *(void ***)dev;
-                void *tR = dvt[V->idxRumble];
-                int shared = -1;
-                for (int k = 0; k < 5; k++) if (g_rumbleTargets[k] == tR) shared = k;
-                if (shared >= 0) L("[gi] %s SetRumbleState %p shared with %s, already hooked", V->name, tR, g_giv[shared].name);
-                else {
-                    MH_STATUS st = MH_CreateHook(tR, g_hRumble[v], (void **)g_oRumble[v]);
-                    if (st == MH_OK) st = MH_EnableHook(tR);
-                    if (st == MH_OK) g_rumbleTargets[v] = tR;
-                    L("[gi] %s hook SetRumbleState @%p: %s", V->name, tR, MH_StatusToString(st));
-                }
-                if (V->idxSendRaw > 0) {
-                    void *tS = dvt[V->idxSendRaw];
-                    MH_STATUS st = MH_CreateHook(tS, g_hRaw[v], (void **)g_oRaw[v]);
-                    if (st == MH_OK) st = MH_EnableHook(tS);
-                    if (st != MH_ERROR_ALREADY_CREATED) L("[gi] %s hook SendRawDeviceOutput @%p: %s", V->name, tS, MH_StatusToString(st));
-                }
+                cen_table(v == 0 ? 0 : 1, dvt, v == 0 ? "dev.v0" : "dev.v3");
+                cen_table(v == 0 ? 2 : 3, *(void ***)gi, v == 0 ? "gi.v0" : "gi.v3");
                 g_giHooked[v] = 1;
                 ((IUnknown *)dev)->lpVtbl->Release((IUnknown *)dev);
             }
@@ -390,6 +382,147 @@ static void gi_probe(void)
         }
         ((IUnknown *)gi)->lpVtbl->Release((IUnknown *)gi);
     }
+}
+
+
+/* ---------------- 0.1.3 diagnostics: GameInput vtable census + Wwise PostEvent log ----------------
+ * Log only. Stubs in census_stubs.S count calls and keep rdx without knowing the signature. */
+#define CEN_N 256
+extern void *cen_stub_table[CEN_N];
+extern void *ak_stub_table[16];
+void *g_cen_orig[CEN_N], *g_cen_rdx[CEN_N]; volatile LONG g_cen_cnt[CEN_N];
+static LONG g_cen_last[CEN_N]; static void *g_cen_fn[CEN_N]; static const char *g_cen_name[4];
+void *g_ak_orig[16]; static int g_ak_kind[16]; static int g_akN;
+
+static int mod_range(void *addr, BYTE **base, SIZE_T *size)
+{
+    HMODULE m = NULL;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)addr, &m) || !m) return 0;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)m + ((IMAGE_DOS_HEADER *)m)->e_lfanew);
+    *base = (BYTE *)m; *size = nt->OptionalHeader.SizeOfImage; return 1;
+}
+
+static void cen_table(int t, void **vt, const char *nm)
+{
+    if (g_cen_name[t]) return;
+    g_cen_name[t] = nm;
+    BYTE *b; SIZE_T sz; int n = 0, alias = 0;
+    if (!mod_range(vt[3], &b, &sz)) { L("[cen] %s: no module for slot 3", nm); return; }
+    for (int sl = 3; sl < 64; sl++) {
+        BYTE *f = vt[sl];
+        if (f < b || f >= b + sz) break;
+        int i = t * 64 + sl;
+        MH_STATUS st = MH_CreateHook(f, cen_stub_table[i], &g_cen_orig[i]);
+        if (st == MH_OK) { MH_EnableHook(f); g_cen_fn[i] = f; n++; }
+        else if (st == MH_ERROR_ALREADY_CREATED) alias++;
+        else L("[cen] %s slot %d @%p: %s", nm, sl, f, MH_StatusToString(st));
+    }
+    L("[cen] %s vtable %p: %d slots hooked, %d aliases (shared targets count once, under the first table)", nm, vt, n, alias);
+}
+
+static void cen_report(void)
+{
+    int lines = 0;
+    for (int i = 0; i < CEN_N && lines < 40; i++) {
+        if (!g_cen_fn[i]) continue;
+        LONG c = g_cen_cnt[i], d = c - g_cen_last[i];
+        if (d <= 0) continue;
+        g_cen_last[i] = c; lines++;
+        unsigned char by[16] = {0}; SIZE_T got = 0; void *r = g_cen_rdx[i];
+        if ((ULONG_PTR)r > 0x10000) ReadProcessMemory(GetCurrentProcess(), r, by, 16, &got);
+        float fl[4]; memcpy(fl, by, 16);
+        L("[cen] %s #%d +%ld (total %ld) rdx=%p bytes=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X floats=%.3f %.3f %.3f %.3f",
+          g_cen_name[i / 64], i % 64, d, c, r, by[0],by[1],by[2],by[3],by[4],by[5],by[6],by[7],by[8],by[9],by[10],by[11],by[12],by[13],by[14],by[15],
+          got ? fl[0] : 0.f, got ? fl[1] : 0.f, got ? fl[2] : 0.f, got ? fl[3] : 0.f);
+    }
+}
+
+/* Wwise: AkUniqueID of a name is FNV-1 32 of the lowercase name, so string posts map to the same ids. */
+#define AKH 4096
+static volatile LONG g_akId[AKH], g_akCnt[AKH], g_akWin[AKH], g_akUnique, g_akTotal;
+static DWORD ak_fnv(const void *s, int wide)
+{
+    DWORD h = 2166136261u;
+    for (int i = 0; i < 256; i++) {
+        unsigned c = wide ? ((const wchar_t *)s)[i] : ((const unsigned char *)s)[i];
+        if (!c) break;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        h = (h * 16777619u) ^ (c & 0xFF);
+    }
+    return h;
+}
+void ak_log(int k, void *a, void *b)
+{
+    (void)b;
+    DWORD id; char nm[128] = "";
+    if (g_ak_kind[k] == 0) id = (DWORD)(ULONG_PTR)a;
+    else {
+        if (!a) return;
+        id = ak_fnv(a, g_ak_kind[k] == 2);
+        if (g_ak_kind[k] == 1) { for (int i = 0; i < 127 && ((char *)a)[i]; i++) nm[i] = ((char *)a)[i]; }
+        else { for (int i = 0; i < 127 && ((wchar_t *)a)[i]; i++) nm[i] = (char)((wchar_t *)a)[i]; }
+    }
+    if (!id) return;
+    InterlockedIncrement(&g_akTotal);
+    for (int j = 0, h = id & (AKH - 1); j < AKH; j++, h = (h + 1) & (AKH - 1)) {
+        LONG cur = g_akId[h];
+        if (cur == (LONG)id) { InterlockedIncrement(&g_akCnt[h]); InterlockedIncrement(&g_akWin[h]); return; }
+        if (cur == 0 && InterlockedCompareExchange(&g_akId[h], (LONG)id, 0) == 0) {
+            InterlockedIncrement(&g_akCnt[h]); InterlockedIncrement(&g_akWin[h]);
+            LONG u = InterlockedIncrement(&g_akUnique);
+            L("[ak] new event %u%s%s (unique #%ld)", id, nm[0] ? " name=" : "", nm, u);
+            return;
+        }
+    }
+}
+
+static void ak_hook(void)
+{
+    BYTE *m = (BYTE *)GetModuleHandleW(NULL);
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(m + ((IMAGE_DOS_HEADER *)m)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dd.VirtualAddress) { L("[ak] exe has no export table"); return; }
+    IMAGE_EXPORT_DIRECTORY *ed = (IMAGE_EXPORT_DIRECTORY *)(m + dd.VirtualAddress);
+    DWORD *names = (DWORD *)(m + ed->AddressOfNames); WORD *ords = (WORD *)(m + ed->AddressOfNameOrdinals);
+    DWORD *fns = (DWORD *)(m + ed->AddressOfFunctions);
+    int seen = 0;
+    for (DWORD i = 0; i < ed->NumberOfNames && g_akN < 16; i++) {
+        const char *n = (const char *)(m + names[i]);
+        if (!strstr(n, "SoundEngine@AK@@")) continue;
+        if (strncmp(n, "?PostEvent@", 11) && strncmp(n, "?ExecuteActionOnEvent@", 22)) continue;
+        seen++;
+        const char *p = strstr(n, "@@YA"); if (!p) continue;
+        p += 4;
+        if (*p == 'W') { p = strstr(p, "@@"); if (!p) continue; p += 2; } /* enum return, AKRESULT */
+        else if (*p == 'I' || *p == 'J' || *p == 'K') p++;                /* AkPlayingID */
+        else continue;
+        int kind = (*p == 'I' || *p == 'K') ? 0 : !strncmp(p, "PEBD", 4) ? 1 : !strncmp(p, "PEB_W", 5) ? 2 : -1;
+        void *f = m + fns[ords[i]];
+        L("[ak] export %s kind=%s @%p", n, kind == 0 ? "id" : kind == 1 ? "char" : kind == 2 ? "wchar" : "skip", f);
+        if (kind < 0) continue;
+        int k = g_akN;
+        g_ak_kind[k] = kind;
+        MH_STATUS st = MH_CreateHook(f, ak_stub_table[k], &g_ak_orig[k]);
+        if (st == MH_OK) st = MH_EnableHook(f);
+        L("[ak] hook #%d: %s", k, MH_StatusToString(st));
+        if (st == MH_OK) g_akN++;
+    }
+    L("[ak] %d PostEvent/ExecuteActionOnEvent exports seen, %d hooked", seen, g_akN);
+}
+
+static void ak_report(void)
+{
+    if (!g_akN) return;
+    char buf[1024]; int len = 0, shown = 0;
+    for (int pass = 0; pass < 12; pass++) {
+        int best = -1; LONG bw = 0;
+        for (int h = 0; h < AKH; h++) if (g_akId[h] && g_akWin[h] > bw) { bw = g_akWin[h]; best = h; }
+        if (best < 0) break;
+        len += snprintf(buf + len, sizeof buf - len, " %u x%ld", (DWORD)g_akId[best], bw);
+        g_akWin[best] = -g_akWin[best] - 1; shown++; /* hide from next pass */
+    }
+    for (int h = 0; h < AKH; h++) { if (g_akWin[h] < 0) g_akWin[h] = 0; else if (g_akWin[h] > 0) g_akWin[h] = 0; }
+    if (shown) L("[ak] last 5s top:%s  (unique %ld, total %ld)", buf, g_akUnique, g_akTotal);
 }
 
 static HMODULE (WINAPI *oLoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
@@ -411,6 +544,7 @@ static DWORD WINAPI gi_thread(void *arg)
         if (!m) m = GetModuleHandleW(L"GameInput.dll");
         if (m) gi_hook_module(m, L"(found loaded)");
         xi_scan();
+        if (t == 15 && C.hookWwise) ak_hook();
         if (pGICreate || pGIInit) {
             int pending = 0;
             for (int v = 0; v < 5; v++) if (g_giHooked[v] == 0) pending = 1;
@@ -839,6 +973,8 @@ static DWORD WINAPI stats_thread(void *arg)
             lw = s_writes; li = s_ioctl;
         }
         tap_stats();
+        cen_report();
+        ak_report();
         if (t == 6 && s_writes == 0 && s_ioctl == 0)
             L("[stats] no DualSense output reports seen after 35 s. The game may use another path (GameInput). Send this log.");
     }
