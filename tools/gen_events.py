@@ -113,8 +113,8 @@ for n in sorted(names):
             else: pr, g = 'knock', 0.7
         out.append((n, cat[n], pr, g, sd, cg)); break
 print('; Gears Haptics sound event haptics, format 3. One line per event: id=preset,gain,side,category  ; name')
-print('; presets: tick click knock thump buzz (shapes in gears_haptics.ini [Presets]). side: B both, L, R, A alternate (boots)')
-print('; category strength is set in gears_haptics.ini [Sound]. cine = cutscene marker, mutes sound haptics while cutscenes play')
+print('; presets: tick click knock thump buzz (shapes in GearsHaptics.ini [Presets]). side: B both, L, R, A alternate (boots)')
+print('; category strength is set in GearsHaptics.ini [Sound]. cine = cutscene marker, mutes sound haptics while cutscenes play')
 print('; comment a line with ; to turn that event off. Delete this file to get the defaults back.')
 print('[Events]')
 sec = None
