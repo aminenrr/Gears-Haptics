@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.5
+* Fix: on some PCs sound haptics were dead for a whole launch (only the startup buzz, then nothing), and it came and went between restarts. The mod hooks the game's Wwise sound calls a few seconds after launch, and by then the game had sometimes used up the memory MinHook needs right next to the exe, so the hooks failed (`MH_ERROR_MEMORY_ALLOC` in the log). The mod now reserves that memory the moment it loads, so the hooks go in every launch.
+* The log says clearly when the sound hooks could not go in.
+
 ## 0.2.4
 * Fix: haptics could go dead after a few game restarts. The haptics now run in their own audio session (Windows was keeping a muted or lowered game session from earlier launches), and the session volume is put back to 100% if anything turns it down.
 * The game's rumble is only replaced while the controller is really playing the haptics. If the stream stalls or the device changes, the game's own rumble comes back and the haptics restart by themselves.

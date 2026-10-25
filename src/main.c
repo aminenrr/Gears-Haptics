@@ -20,10 +20,11 @@
 #include <string.h>
 #include <math.h>
 #include "MinHook.h"
+#include "../third_party/minhook/src/buffer.h"
 #include "winmm_names.h"
 #include "events_default.h"
 
-#define LANTERN_VERSION "0.2.4"
+#define LANTERN_VERSION "0.2.5"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -720,6 +721,7 @@ static void ak_hook(void)
         if (st == MH_OK) g_akN++;
     }
     L("[ak] %d PostEvent/ExecuteActionOnEvent exports seen, %d hooked", seen, g_akN);
+    if (seen && !g_akN) L("[ak] WARNING: no PostEvent hook went in, sound haptics are off this launch");
 }
 
 /* ---- name scan: Wwise ids are FNV-1 32 of the lowercase event name. UE keeps asset
@@ -955,6 +957,8 @@ static int hook(HMODULE m, const char *name, void *det, void **orig)
     return s == MH_OK;
 }
 
+static void *g_exeBlock;
+
 static void install_hooks(void)
 {
     HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
@@ -963,6 +967,18 @@ static void install_hooks(void)
     MH_STATUS s = MH_Initialize();
     L("MinHook init: %s", MH_StatusToString(s));
     if (s != MH_OK) return;
+    {   /* The Wwise hooks go in 15 s after launch, and by then the game has often filled the
+           address space within MinHook's +-1 GB of the exe, so every PostEvent hook failed with
+           MH_ERROR_MEMORY_ALLOC and the launch had no sound haptics at all. Take a trampoline
+           block next to the exe now, while that space is still free, and keep one slot of it
+           so MinHook never releases the block. The PostEvent hooks then reuse it. */
+        BYTE *exe = (BYTE *)GetModuleHandleW(NULL);
+        g_exeBlock = AllocateBuffer(exe);
+        if (g_exeBlock) {
+            long long d = (long long)((BYTE *)g_exeBlock - exe);
+            L("trampoline block near exe reserved at %p (%+lld MB from exe)", g_exeBlock, d / (1024 * 1024));
+        } else L("could not reserve a trampoline block near the exe, sound haptics may fail to hook");
+    }
     hook(kb, "CreateFileW", hCreateFileW, (void **)&oCreateFileW);
     hook(kb, "CreateFileA", hCreateFileA, (void **)&oCreateFileA);
     hook(kb, "WriteFile", hWriteFile, (void **)&oWriteFile);
