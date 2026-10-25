@@ -128,7 +128,7 @@ static void load_events(void)
         wchar_t *v = wcschr(e, L'='); if (!id || !v) continue;
         v++;
         wchar_t pn[16] = L""; int k = 0;
-        while (*v && *v != L',' && k < 15) pn[k++] = (wchar_t)towlower(*v++);
+        while (*v && *v != L',' && *v != L' ' && *v != L';' && *v != L'\t' && k < 15) pn[k++] = (wchar_t)towlower(*v++);
         pn[k] = 0;
         int pi = -1;
         if (!wcscmp(pn, L"cine")) pi = PRESET_CINE;
@@ -1212,8 +1212,8 @@ static void endpoint_volume_check(IMMDevice *dev)
     BOOL mute = FALSE; float lvl = 1.f;
     IAudioEndpointVolume_GetMute(ev, &mute);
     IAudioEndpointVolume_GetMasterVolumeLevelScalar(ev, &lvl);
-    L("[audio] controller endpoint volume %.0f%%%s", lvl * 100, mute ? ", MUTED" : "");
-    if (mute || lvl < 0.05f) L("[audio] the Wireless Controller device is muted or at 0 in Windows sound settings, haptics will be silent. Turn it back up.");
+    /* info only: tested 2026-10-25, haptics still play with the endpoint at 0% */
+    L("[audio] controller endpoint volume %.0f%%%s (info only)", lvl * 100, mute ? ", muted" : "");
     IAudioEndpointVolume_Release(ev);
 }
 
