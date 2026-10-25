@@ -8,7 +8,7 @@ mkdir -p out
 $ZIG cc -target x86_64-windows-gnu -shared -O2 -s -o out/winmm.dll \
   -I$M/include src/main.c src/winmm_stubs.c src/census_stubs.c \
   $M/src/hook.c $M/src/buffer.c $M/src/trampoline.c $M/src/hde/hde64.c \
-  -lole32 -luuid -lkernel32 -luser32 -lpsapi
+  -lole32 -luuid -lkernel32 -luser32 -lpsapi -lcfgmgr32
 $ZIG cc -O2 -o out/mkini tools/mkini.c
 ./out/mkini
 ls -la out/winmm.dll out/GearsHaptics.ini out/GearsHaptics_events.ini

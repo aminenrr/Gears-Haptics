@@ -117,6 +117,7 @@ Both write `out\winmm.dll`, `out\GearsHaptics.ini` and `out\GearsHaptics_events.
 * No haptics on Bluetooth: make sure DSZ is in DualSense mode (or DSX has Bluetooth haptics on) before starting the game.
 * No sound haptics but rumble works: make sure `HookWwise=1`.
 * The game crashes about 15 seconds after launch: set `HookWwise=0` and report it with your log.
+* Haptics stop after a while or after a few launches: update to 0.2.4 or newer. If it still happens, check that the Wireless Controller device is not muted in Windows sound settings, and send `GearsHaptics.log` from that session (it is overwritten on every launch).
 * Too strong or too weak: change `Strength`, or a single category in `[Sound]`.
 
 ## Disclaimer

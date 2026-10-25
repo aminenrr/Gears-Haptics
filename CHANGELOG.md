@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.4
+* Fix: haptics could go dead after a few game restarts. The haptics now run in their own audio session (Windows was keeping a muted or lowered game session from earlier launches), and the session volume is put back to 100% if anything turns it down.
+* The game's rumble is only replaced while the controller is really playing the haptics. If the stream stalls or the device changes, the game's own rumble comes back and the haptics restart by themselves.
+* With more than one controller audio device (a second pad, DSX or DSZ, a replugged pad), the mod uses the one that belongs to the controller the game opened.
+* The log warns when the Wireless Controller device is muted or at 0 in Windows sound settings.
+* Sound haptics no longer stall for a moment after the stream restarts.
+* Development diagnostics (GameInput census, audio tap) are off by default, `GameInputCensus` and `AudioTap` in `[Diag]`.
+* The connect chime plays once per launch, not on every restart of the stream.
+
 ## 0.2.3
 * First public release.
 * Diagnostic logging and the name scan are off by default.

@@ -34,6 +34,9 @@ static const char *DEFAULT_INI =
     "LogPosts=0\r\n"
     "; for mapping new sounds: look up event names in game memory at 1, 3 and 6 minutes, writes GearsHaptics_catalog.txt (can stutter while it runs)\r\n"
     "NameScan=0\r\n"
+    "; diagnostics for development only, leave at 0 (GameInput call census, game audio stream tap)\r\n"
+    "GameInputCensus=0\r\n"
+    "AudioTap=0\r\n"
     "; the sound event list lives in GearsHaptics_events.ini next to this file\r\n";
 
 /* added to an older GearsHaptics.ini that has no [Sound] section yet */

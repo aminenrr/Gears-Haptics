@@ -12,6 +12,9 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <functiondiscoverykeys_devpkey.h>
+#include <endpointvolume.h>
+#include <cfgmgr32.h>
+#include <devpkey.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +23,7 @@
 #include "winmm_names.h"
 #include "events_default.h"
 
-#define LANTERN_VERSION "0.2.3"
+#define LANTERN_VERSION "0.2.4"
 
 /* ---------------- winmm forwarding ---------------- */
 void *winmm_ptrs[WINMM_COUNT];
@@ -53,7 +56,7 @@ static void L(const char *fmt, ...)
 }
 
 static struct {
-    int enabled, keepNative, logReports, hookWwise, logPosts, nameScan;
+    int enabled, keepNative, logReports, hookWwise, logPosts, nameScan, census, audioTap;
     float curve, evGain, cineHold; int cineMute;
     float strength, lowHz, highHz, lowGain, highGain, bleed, trGain, trThresh, chime;
 } C;
@@ -228,6 +231,8 @@ static void load_config(void)
     C.hookWwise = (int)ini_f(L"Diag", L"HookWwise", 1);
     C.logPosts   = (int)ini_f(L"Diag", L"LogPosts", 0);
     C.nameScan   = (int)ini_f(L"Diag", L"NameScan", 0);
+    C.census     = (int)ini_f(L"Diag", L"GameInputCensus", 0);
+    C.audioTap   = (int)ini_f(L"Diag", L"AudioTap", 0);
     C.curve      = ini_f(L"Tuning", L"Curve", 0.5f);
     C.evGain     = ini_f(L"Tuning", L"EventGain", 1.0f);
     C.cineMute   = (int)ini_f(L"Sound", L"CutsceneMute", 1);
@@ -844,13 +849,37 @@ static DWORD WINAPI gi_thread(void *arg)
         if (m) gi_hook_module(m, L"(found loaded)");
         xi_scan();
         if (t == 15 && C.hookWwise) { ak_hook(); if (g_akN && C.nameScan) CloseHandle(CreateThread(NULL, 0, scan_thread, NULL, 0, NULL)); }
-        if (pGICreate || pGIInit) {
+        if (C.census && (pGICreate || pGIInit)) {
             int pending = 0;
             for (int v = 0; v < 5; v++) if (g_giHooked[v] == 0) pending = 1;
             if (pending) gi_probe();
         }
         Sleep(t < 60 ? 1000 : 3000);
     }
+}
+
+/* ---------------- 0.2.4: which controller the game uses ----------------
+ * The game's HID path is stored here (cheap, inside the CreateFile hook). The watchdog
+ * thread turns it into a container id later, so the haptics stream can pick the audio
+ * endpoint of that same controller instead of the first "Wireless Controller" in the list. */
+static wchar_t g_dsPath[512];
+static volatile LONG g_dsPathSeq;
+static SRWLOCK g_dsPathLock = SRWLOCK_INIT;
+static GUID g_dsContainer; static volatile LONG g_dsContainerOk;
+static void ds_path_seen(const wchar_t *p)
+{
+    AcquireSRWLockExclusive(&g_dsPathLock);
+    if (_wcsicmp(g_dsPath, p)) { wcsncpy(g_dsPath, p, 511); g_dsPath[511] = 0; InterlockedIncrement(&g_dsPathSeq); }
+    ReleaseSRWLockExclusive(&g_dsPathLock);
+}
+static int hid_container(const wchar_t *path, GUID *out)
+{
+    wchar_t inst[512]; ULONG sz = sizeof inst; DEVPROPTYPE t; DEVINST di;
+    if (CM_Get_Device_Interface_PropertyW(path, &DEVPKEY_Device_InstanceId, &t, (PBYTE)inst, &sz, 0) != CR_SUCCESS) return 0;
+    if (CM_Locate_DevNodeW(&di, inst, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) return 0;
+    sz = sizeof *out;
+    if (CM_Get_DevNode_PropertyW(di, &DEVPKEY_Device_ContainerId, &t, (PBYTE)out, &sz, 0) != CR_SUCCESS) return 0;
+    return 1;
 }
 
 /* ---------------- hooks ---------------- */
@@ -879,7 +908,7 @@ static HANDLE WINAPI hCreateFileW(LPCWSTR p, DWORD a, DWORD s, LPSECURITY_ATTRIB
 {
     HANDLE h = oCreateFileW(p, a, s, sa, d, f, t);
     if (h != INVALID_HANDLE_VALUE && !t_inHook && p && p[0] == L'\\' && p[1] == L'\\') {
-        if (is_ds_path_w(p)) { remember(h, 1); L("[hid] game opened DualSense: %ls (access 0x%lX, flags 0x%lX) -> %p", p, a, f, h); }
+        if (is_ds_path_w(p)) { remember(h, 1); ds_path_seen(p); L("[hid] game opened DualSense: %ls (access 0x%lX, flags 0x%lX) -> %p", p, a, f, h); }
     }
     return h;
 }
@@ -889,7 +918,7 @@ static HANDLE WINAPI hCreateFileA(LPCSTR p, DWORD a, DWORD s, LPSECURITY_ATTRIBU
     HANDLE h = oCreateFileA(p, a, s, sa, d, f, t);
     if (h != INVALID_HANDLE_VALUE && !t_inHook && p && p[0] == '\\' && p[1] == '\\') {
         wchar_t w[512]; MultiByteToWideChar(CP_ACP, 0, p, -1, w, 512);
-        if (is_ds_path_w(w)) { remember(h, 1); L("[hid] game opened DualSense (A): %s -> %p", p, h); }
+        if (is_ds_path_w(w)) { remember(h, 1); ds_path_seen(w); L("[hid] game opened DualSense (A): %s -> %p", p, h); }
     }
     return h;
 }
@@ -1118,26 +1147,74 @@ static int chan_index(DWORD mask, DWORD bit, DWORD alt, int fb)
     return popcount(mask & (b - 1));
 }
 
-static IMMDevice *find_ds_endpoint(IMMDeviceEnumerator *en, wchar_t *nameOut)
+static const PROPERTYKEY PK_ContainerId = { {0x8c7ed206,0x3f8a,0x4827,{0xb3,0xab,0xae,0x9e,0x1f,0xae,0xfc,0x6c}}, 2 };
+
+/* 0.2.4: pick the controller endpoint. With more than one "Wireless Controller" (a second pad,
+ * DSX or DSZ, a replugged pad), prefer the one in the same container as the HID device the
+ * game opened. Falls back to the first one. idOut gets the endpoint id (CoTaskMemFree it). */
+static IMMDevice *find_ds_endpoint(IMMDeviceEnumerator *en, wchar_t *nameOut, wchar_t **idOut, int quiet)
 {
-    IMMDeviceCollection *col = NULL; IMMDevice *found = NULL;
+    IMMDeviceCollection *col = NULL; IMMDevice *first = NULL, *match = NULL; int count = 0;
+    wchar_t firstName[256] = L"", matchName[256] = L"";
+    if (idOut) *idOut = NULL;
     if (FAILED(IMMDeviceEnumerator_EnumAudioEndpoints(en, eRender, DEVICE_STATE_ACTIVE, &col))) return NULL;
     UINT n = 0; IMMDeviceCollection_GetCount(col, &n);
-    for (UINT i = 0; i < n && !found; i++) {
+    int haveC = g_dsContainerOk; GUID want = g_dsContainer;
+    for (UINT i = 0; i < n; i++) {
         IMMDevice *d = NULL; if (FAILED(IMMDeviceCollection_Item(col, i, &d))) continue;
-        IPropertyStore *ps = NULL;
+        IPropertyStore *ps = NULL; int keep = 0;
         if (SUCCEEDED(IMMDevice_OpenPropertyStore(d, STGM_READ, &ps))) {
             PROPVARIANT v; PropVariantInit(&v);
-            if (SUCCEEDED(IPropertyStore_GetValue(ps, &PKEY_Device_FriendlyName, &v)) && v.vt == VT_LPWSTR) {
-                if (wcsstr(v.pwszVal, L"Wireless Controller")) { found = d; wcsncpy(nameOut, v.pwszVal, 255); nameOut[255] = 0; }
+            if (SUCCEEDED(IPropertyStore_GetValue(ps, &PKEY_Device_FriendlyName, &v)) && v.vt == VT_LPWSTR && wcsstr(v.pwszVal, L"Wireless Controller")) {
+                count++;
+                if (!first) { first = d; keep = 1; wcsncpy(firstName, v.pwszVal, 255); }
+                if (haveC && !match) {
+                    PROPVARIANT c; PropVariantInit(&c);
+                    if (SUCCEEDED(IPropertyStore_GetValue(ps, &PK_ContainerId, &c)) && c.vt == VT_CLSID && c.puuid && IsEqualGUID(c.puuid, &want)) {
+                        match = d; keep = 1; wcsncpy(matchName, v.pwszVal, 255);
+                    }
+                    PropVariantClear(&c);
+                }
             }
             PropVariantClear(&v);
             IPropertyStore_Release(ps);
         }
-        if (!found) IMMDevice_Release(d);
+        if (!keep) IMMDevice_Release(d);
     }
     IMMDeviceCollection_Release(col);
+    IMMDevice *found = match ? match : first;
+    if (match && first && first != match) IMMDevice_Release(first);
+    if (found) {
+        wcsncpy(nameOut, match ? matchName : firstName, 255); nameOut[255] = 0;
+        if (idOut) IMMDevice_GetId(found, idOut);
+        if (!quiet && count > 1) L("[audio] %d controller audio endpoints found, using %s", count, match ? "the one that matches the game's controller" : "the first one (game's controller not known yet)");
+    }
     return found;
+}
+
+/* stream health, shared with the watchdog */
+static volatile LONG g_rebuild;
+static wchar_t g_curEp[512];
+static SRWLOCK g_curEpLock = SRWLOCK_INIT;
+
+/* our own audio session: Windows remembers per app volume and mute, and with a NULL session
+ * the haptics shared the game's own session on the controller, so a muted or lowered game
+ * session (kept by Windows across launches) silenced the haptics too. */
+static const GUID GH_SESSION = {0x6a1c3b52,0x9d4e,0x4f17,{0x8a,0x2b,0x5e,0x91,0x0c,0x7d,0x33,0xe4}};
+
+static void endpoint_volume_check(IMMDevice *dev)
+{
+    IAudioEndpointVolume *ev = NULL;
+    t_inHook++;
+    HRESULT hr = IMMDevice_Activate(dev, &IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, (void **)&ev);
+    t_inHook--;
+    if (FAILED(hr) || !ev) return;
+    BOOL mute = FALSE; float lvl = 1.f;
+    IAudioEndpointVolume_GetMute(ev, &mute);
+    IAudioEndpointVolume_GetMasterVolumeLevelScalar(ev, &lvl);
+    L("[audio] controller endpoint volume %.0f%%%s", lvl * 100, mute ? ", MUTED" : "");
+    if (mute || lvl < 0.05f) L("[audio] the Wireless Controller device is muted or at 0 in Windows sound settings, haptics will be silent. Turn it back up.");
+    IAudioEndpointVolume_Release(ev);
 }
 
 typedef struct { double ph; float amp, decay, hz; int left, side; } Voice;
@@ -1246,10 +1323,14 @@ static void synth_fill(Synth *S, BYTE *out, UINT frames, int ch, int isFloat, in
 
 static int run_stream(IMMDeviceEnumerator *en)
 {
-    wchar_t name[256] = L"";
-    IMMDevice *dev = find_ds_endpoint(en, name);
+    wchar_t name[256] = L""; wchar_t *epId = NULL;
+    IMMDevice *dev = find_ds_endpoint(en, name, &epId, 0);
     if (!dev) return 0;
-    IAudioClient *ac = NULL; IAudioRenderClient *rc = NULL; WAVEFORMATEX *mix = NULL; int ok = 0;
+    IAudioClient *ac = NULL; IAudioRenderClient *rc = NULL; ISimpleAudioVolume *sv = NULL; WAVEFORMATEX *mix = NULL; int ok = 0;
+    InterlockedExchange(&g_rebuild, 0);
+    AcquireSRWLockExclusive(&g_curEpLock);
+    wcsncpy(g_curEp, epId ? epId : L"", 511); g_curEp[511] = 0;
+    ReleaseSRWLockExclusive(&g_curEpLock);
     t_inHook++;
     HRESULT ahr = IMMDevice_Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&ac);
     t_inHook--;
@@ -1264,44 +1345,78 @@ static int run_stream(IMMDeviceEnumerator *en)
         isFloat = IsEqualGUID(&x->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
     } else if (mix->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) isFloat = 1;
     L("[audio] DualSense endpoint: %ls (%d Hz, %d ch, %d bit, %s, mask 0x%lX)", name, sr, ch, bits, isFloat ? "float" : "pcm", mask);
-    if (ch < 4) { L("[audio] endpoint has %d channels, need 4 (is the controller on USB?)", ch); goto done; }
+    if (ch < 4) { L("[audio] endpoint has %d channels, need 4 (is the controller on USB? Is the Wireless Controller device set to 4 channels in Windows sound settings?)", ch); goto done; }
     if (popcount(mask) != ch) mask = (ch == 4) ? (0x1 | 0x2 | SPK_BL | SPK_BR) : 0;
     int iL = chan_index(mask, SPK_BL, SPK_SL, 2), iR = chan_index(mask, SPK_BR, SPK_SR, 3);
     if (iL >= ch || iR >= ch) { iL = 2; iR = 3; }
     L("[audio] haptic channels: left actuator ch%d, right actuator ch%d", iL + 1, iR + 1);
+    endpoint_volume_check(dev);
 
     REFERENCE_TIME dur = 300000; /* 30 ms */
-    HRESULT hr = IAudioClient_Initialize(ac, AUDCLNT_SHAREMODE_SHARED, 0, dur, 0, mix, NULL);
+    HRESULT hr = IAudioClient_Initialize(ac, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_SESSIONFLAGS_EXPIREWHENUNOWNED | AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE, dur, 0, mix, &GH_SESSION);
     if (FAILED(hr)) { L("[audio] Initialize failed 0x%08lX", hr); goto done; }
     if (FAILED(IAudioClient_GetService(ac, &IID_IAudioRenderClient, (void **)&rc))) goto done;
     g_ourRender = rc;
+    if (SUCCEEDED(IAudioClient_GetService(ac, &IID_ISimpleAudioVolume, (void **)&sv)) && sv) {
+        float v = 1.f; BOOL m = FALSE;
+        ISimpleAudioVolume_GetMasterVolume(sv, &v); ISimpleAudioVolume_GetMute(sv, &m);
+        if (v < 0.999f || m) L("[audio] haptics session was at %.0f%%%s, reset to 100%%", v * 100, m ? " and muted" : "");
+        ISimpleAudioVolume_SetMasterVolume(sv, 1.f, NULL); ISimpleAudioVolume_SetMute(sv, FALSE, NULL);
+    }
     UINT32 bufFrames = 0; IAudioClient_GetBufferSize(ac, &bufFrames);
     Synth S = {0};
-    if (C.chime > 0) S.chime = (int)(sr * 0.12f);
+    S.evR = g_evW;                      /* 0.2.4: start at the queue head, a fresh Synth used to stall on old slots */
+    static int chimed;                  /* chime only on the first stream, not on every rebuild */
+    if (C.chime > 0 && !chimed) { S.chime = (int)(sr * 0.12f); chimed = 1; }
     BYTE *p;
     if (SUCCEEDED(IAudioRenderClient_GetBuffer(rc, bufFrames, &p))) { synth_fill(&S, p, bufFrames, ch, isFloat, bits, iL, iR, sr); IAudioRenderClient_ReleaseBuffer(rc, bufFrames, 0); }
-    IAudioClient_Start(ac);
-    InterlockedExchange(&g_hapticsLive, 1);
-    L("[audio] haptics streaming (buffer %u frames)", bufFrames);
+    if (FAILED(IAudioClient_Start(ac))) { L("[audio] Start failed"); goto done; }
+    L("[audio] stream started (buffer %u frames), waiting for the device to play it", bufFrames);
     ok = 1;
+    /* 0.2.4: the game's rumble is only replaced while the device is really pulling our audio.
+     * If the stream stops moving, the endpoint changes or the session gets muted, haptics go
+     * off (the game's own rumble comes back) and the stream is rebuilt. */
+    ULONGLONG lastMove = GetTickCount64(), lastVol = lastMove;
+    UINT32 lastPad = bufFrames;
     for (;;) {
         UINT32 pad = 0;
         hr = IAudioClient_GetCurrentPadding(ac, &pad);
-        if (FAILED(hr)) { L("[audio] stream lost 0x%08lX, retrying", hr); break; }
+        if (FAILED(hr)) { L("[audio] stream lost 0x%08lX, rebuilding", hr); break; }
+        ULONGLONG now = GetTickCount64();
+        if (pad < lastPad) {
+            lastMove = now;
+            if (!g_hapticsLive) { InterlockedExchange(&g_hapticsLive, 1); L("[audio] haptics streaming"); }
+        }
+        if (now - lastMove > 750) { L("[audio] stream stalled (device stopped playing it), rebuilding"); break; }
+        if (g_rebuild) { L("[audio] controller endpoint changed, rebuilding"); break; }
+        if (sv && now - lastVol > 2000) {
+            lastVol = now; float v = 1.f; BOOL m = FALSE;
+            if (SUCCEEDED(ISimpleAudioVolume_GetMasterVolume(sv, &v)) && SUCCEEDED(ISimpleAudioVolume_GetMute(sv, &m)) && (v < 0.999f || m)) {
+                L("[audio] haptics session was turned down to %.0f%%%s, reset to 100%%", v * 100, m ? " and muted" : "");
+                ISimpleAudioVolume_SetMasterVolume(sv, 1.f, NULL); ISimpleAudioVolume_SetMute(sv, FALSE, NULL);
+            }
+        }
         UINT32 avail = bufFrames - pad;
         if (avail >= 64) {
-            if (FAILED(IAudioRenderClient_GetBuffer(rc, avail, &p))) break;
+            if (FAILED(IAudioRenderClient_GetBuffer(rc, avail, &p))) { L("[audio] GetBuffer failed, rebuilding"); break; }
             synth_fill(&S, p, avail, ch, isFloat, bits, iL, iR, sr);
             IAudioRenderClient_ReleaseBuffer(rc, avail, 0);
+            pad += avail;
         }
+        lastPad = pad;
         Sleep(4);
     }
     InterlockedExchange(&g_hapticsLive, 0);
+    L("[audio] haptics off, game rumble passes through until the stream is back");
     IAudioClient_Stop(ac);
 done:
+    if (sv) ISimpleAudioVolume_Release(sv);
     if (rc) IAudioRenderClient_Release(rc);
     if (mix) CoTaskMemFree(mix);
     if (ac) IAudioClient_Release(ac);
+    g_ourClient = NULL; g_ourRender = NULL;
+    if (epId) CoTaskMemFree(epId);
     IMMDevice_Release(dev);
     return ok;
 }
@@ -1313,11 +1428,46 @@ static DWORD WINAPI audio_thread(void *arg)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     IMMDeviceEnumerator *en = NULL;
     if (FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void **)&en))) { L("[audio] no device enumerator"); return 0; }
-    install_audio_hooks(en);
+    if (C.audioTap) install_audio_hooks(en);
     int warned = 0;
     for (;;) {
-        if (!run_stream(en) && !warned) { warned = 1; L("[audio] DualSense audio endpoint not found yet. Plug the controller in by USB. Native rumble stays on until then."); }
-        Sleep(3000);
+        int ok = run_stream(en);
+        if (!ok && !warned) { warned = 1; L("[audio] DualSense audio endpoint not found yet. Plug the controller in by USB. Native rumble stays on until then."); }
+        Sleep(ok ? 500 : 3000);
+    }
+}
+
+/* 0.2.4 watchdog, low priority: learns which controller the game opened and asks the
+ * stream to move when a better matching endpoint shows up or ours goes away. */
+static DWORD WINAPI watch_thread(void *arg)
+{
+    (void)arg;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator *en = NULL;
+    if (FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void **)&en))) return 0;
+    LONG seenSeq = 0;
+    for (;;) {
+        Sleep(2000);
+        LONG seq = g_dsPathSeq;
+        if (seq != seenSeq) {
+            seenSeq = seq; wchar_t path[512];
+            AcquireSRWLockShared(&g_dsPathLock); wcscpy(path, g_dsPath); ReleaseSRWLockShared(&g_dsPathLock);
+            GUID c; t_inHook++; int got = hid_container(path, &c); t_inHook--;
+            if (got) { g_dsContainer = c; InterlockedExchange(&g_dsContainerOk, 1); L("[watch] game's controller container {%08lX-...}", c.Data1); }
+            else L("[watch] could not read the container of the game's controller");
+        }
+        wchar_t cur[512];
+        AcquireSRWLockShared(&g_curEpLock); wcscpy(cur, g_curEp); ReleaseSRWLockShared(&g_curEpLock);
+        if (!cur[0]) continue;
+        wchar_t nm[256], *id = NULL;
+        t_inHook++;
+        IMMDevice *d = find_ds_endpoint(en, nm, &id, 1);
+        t_inHook--;
+        if (d) {
+            if (id && wcscmp(id, cur)) InterlockedExchange(&g_rebuild, 1);
+            IMMDevice_Release(d);
+        } else InterlockedExchange(&g_rebuild, 1);
+        if (id) CoTaskMemFree(id);
     }
 }
 
@@ -1374,5 +1524,6 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)
     CloseHandle(CreateThread(NULL, 0, stats_thread, NULL, 0, NULL));
     CloseHandle(CreateThread(NULL, 0, ak_thread, NULL, 0, NULL));
     CloseHandle(CreateThread(NULL, 0, gi_thread, NULL, 0, NULL));
+    CloseHandle(CreateThread(NULL, 0, watch_thread, NULL, 0, NULL));
     return TRUE;
 }

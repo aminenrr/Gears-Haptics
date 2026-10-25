@@ -7,7 +7,7 @@ where zig >nul 2>nul || set ZIG=python -m ziglang
 %ZIG% cc -target x86_64-windows-gnu -shared -O2 -s -o out\winmm.dll ^
   -Ithird_party\minhook\include src\main.c src\winmm_stubs.c src\census_stubs.c ^
   third_party\minhook\src\hook.c third_party\minhook\src\buffer.c third_party\minhook\src\trampoline.c third_party\minhook\src\hde\hde64.c ^
-  -lole32 -luuid -lkernel32 -luser32 -lpsapi
+  -lole32 -luuid -lkernel32 -luser32 -lpsapi -lcfgmgr32
 if errorlevel 1 exit /b 1
 %ZIG% cc -O2 -o out\mkini.exe tools\mkini.c
 if errorlevel 1 exit /b 1
